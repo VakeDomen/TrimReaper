@@ -44,12 +44,13 @@ data:
   max_docs: 2000            # 0 = unlimited
 
 genome:
-  min_rotations: 1                 # overridden to 1 at runtime for every budget
-  max_rotations: 2048              # overridden per budget = int(rpr*target)
-  rotations_per_removed: 1.0       # default when rotation_sweep is empty
+  min_rotations: 256              # evolvable-length floor (reviewer: min 256)
+  max_rotations: 4096             # hard ceiling for the largest budget (8x=4096)
+  rotations_per_removed: 1.0      # budget = clamp(rpr*target, min, max); overridden per sweep budget
+  initial_rotation_frac: 0.75     # initial genomes start near the budget, not the floor
   min_angle: -6.283185307179586    # +/- 2pi
   max_angle: 6.283185307179586
-  delete_survive_bias: 0.7         # rotate delete<->survive pairs
+  delete_survive_bias: 0.95       # STRONGLY prefer deleted<->kept (cross-boundary) rotations
 
 ga:
   population: 32
@@ -80,7 +81,7 @@ search:
   fast_eval_chunk: 0        # 0 = AUTO-size from free VRAM (safe, no OOM)
   freeze_mask: true         # cmd_rotsearch sets frozen_pruned at runtime
   frozen_pruned: []         # filled by cmd_rotsearch with the amag[:512] mask
-  rotation_sweep: [0.5, 1.0, 2.0, 4.0]   # rotations-per-removed per budget
+  rotation_sweep: [1.0, 2.0, 4.0, 8.0]   # rotations-per-removed => 512/1024/2048/4096 rot
   # Diversity instrumentation (GPU-free, printed each generation). Every
   # generation logs mask metrics (unique_masks, mean pairwise Jaccard distance,
   # dist-to-elite, elite-overlap histogram), rotation metrics (unique_pairs,

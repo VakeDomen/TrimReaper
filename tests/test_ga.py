@@ -20,6 +20,7 @@ def _cfg():
     c = Config.defaults()
     c.genome.min_rotations = 4
     c.genome.max_rotations = 8
+    c.genome.rotations_per_removed = 0.5
     c.ga.population = 8
     c.search.epsilon = 0.01
     return c

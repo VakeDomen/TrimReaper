@@ -63,18 +63,26 @@ class ModelConfig:
 class GenomeConfig:
     """Genome representation settings."""
 
-    min_rotations: int = 16
-    max_rotations: int = 64
+    min_rotations: int = 256
+    max_rotations: int = 4096
     # Rotation budget scales with the deletion target so larger prunes get more
     # rotational freedom instead of a fixed cap: budget =
     # clamp(int(rotations_per_removed * target), min_rotations, max_rotations).
-    rotations_per_removed: float = 0.5
+    # Budget ladder for 512 deleted channels (2^x * deleted): 1x=512, 2x=1024,
+    # 4x=2048, 8x=4096 (see the rotsearch rotation_sweep).
+    rotations_per_removed: float = 1.0
+    # Initial genomes start with a substantial rotation count rather than the
+    # bare floor: n_rot ~ uniform in [max(min_rot, ceil(initial_frac*budget)),
+    # budget], so early evolution isn't artificially sparse.
+    initial_rotation_frac: float = 0.75
     min_angle: float = -3.141592653589793 * 2
     max_angle: float = 3.141592653589793 * 2
-    # Deletion-bias window: with some probability, rotation pairs are drawn
-    # such that one endpoint is a candidate-for-deletion and the other a
-    # surviving channel (per PLAN.md section 6).
-    delete_survive_bias: float = 0.7
+    # Cross-boundary preference: with this probability, rotation pairs are drawn
+    # deleted<->surviving (one pruned endpoint + one kept endpoint), so rotations
+    # actually perturb the removed subspace rather than mostly kept<->kept
+    # (per PLAN.md section 6). Strongly biased (0.95) per the rotation-coverage
+    # finding that only ~13/512 deleted channels were being touched.
+    delete_survive_bias: float = 0.95
 
 
 @dataclass

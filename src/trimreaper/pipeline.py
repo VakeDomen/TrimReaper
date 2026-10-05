@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -173,7 +174,8 @@ def _danger(v, low_thresholds=None, high_thresholds=None):
 
 
 def _emit_generation(target, gen, total, best_kl, arch_kl, removed, div,
-                     tag="GA", prev_arch_kl=None, pop_size=0, debug_every=10):
+                     tag="GA", prev_arch_kl=None, pop_size=0, debug_every=10,
+                     gen_time=0.0):
     """Emit the reviewer's compact per-generation log block:
         1. is fitness/archive improving?
         2. is the pruning population collapsing?
@@ -205,8 +207,10 @@ def _emit_generation(target, gen, total, best_kl, arch_kl, removed, div,
                 a = f"  arch={_c(f'{arch_kl:.5f} \u2014', 'dim')}"
         else:
             a = f"  arch={_c(f'{arch_kl:.5f}', 'dim')}"
+        gt_s = _c(f"{gen_time:.1f}s", "yellow") if gen_time > 0.0 else ""
         _emit_line(
-            f"[{tag_label}  t={target:4d}  g={gen:02d}/{total}] fit={fitv}{a}  removed={removed_s}"
+            f"[{tag_label}  t={target:4d}  g={gen:02d}/{total}] fit={fitv}{a}  "
+            f"removed={removed_s}{('  gen=%s' % gt_s) if gt_s else ''}"
         )
 
         # ---- line 2: mask diversity / collapse ----
@@ -227,6 +231,9 @@ def _emit_generation(target, gen, total, best_kl, arch_kl, removed, div,
         pfrac = f" ({100.0*pruned/removed:.1f}%)" if pruned == pruned and removed else ""
         pct = (100.0 * pruned / removed) if (pruned == pruned and removed) else float("nan")
         pruned_s = _c(_fmt(pruned, 1), _danger(pct / 100.0, low_thresholds=(0.15, 0.05)))
+        eff = r.get("mean_effective_rotations", float("nan"))
+        cov = r.get("mean_deleted_channel_coverage", float("nan"))   # 0..1
+        cov_s = _c(f"{100.0*cov:.0f}%", _danger(cov, low_thresholds=(0.15, 0.05)))
         rd = r.get("mean_rot_distance_to_elite", float("nan"))
         lin = div.get("lineage_frac_elite", float("nan"))
         lin_s = _c(f"{100.0*lin:.1f}%", _danger(lin, high_thresholds=(0.75, 0.9)))
@@ -234,6 +241,7 @@ def _emit_generation(target, gen, total, best_kl, arch_kl, removed, div,
             f"  {_c('ROT', 'magenta')}   n={_fmt(r.get('mean_rotations'), 1)}  "
             f"pairs={r.get('unique_pairs','n/a')}  chans={_fmt(r.get('mean_unique_channels_touched'), 1)}  "
             f"{_c('pruned', 'bold')}={pruned_s}/{removed}{pfrac}  "
+            f"{_c('cov', 'bold')}={cov_s}  {_c('eff', 'bold')}={_fmt(eff, 1)}  "
             f"dist={_fmt(rd)}  lineage={lin_s}"
         )
 
@@ -249,6 +257,42 @@ def _emit_generation(target, gen, total, best_kl, arch_kl, removed, div,
             )
 
         # blank line between generations (easier to scan a long run)
+        _emit_line("")
+    except Exception:
+        pass
+
+
+def _emit_legend(tag: str = "GA") -> None:
+    """Print a one-time legend explaining the per-generation terms, colored to
+    match the live output. Fenced by blank lines."""
+    try:
+        _emit_line("")
+        _emit_line(f"{_c('legend', 'bold')}   one 3-line block per generation:")
+        _emit_line(f"  {_c('fit', 'white')}       = best fitness (KL) this generation")
+        _emit_line(f"  {_c('arch', 'bold green')}      = best held-out KL (\u2193 improved / \u2014 unchanged)")
+        _emit_line(f"  {_c('removed', 'white')}    = channels pruned")
+        _emit_line(
+            f"  {_c('MASK', 'blue')}: {_c('uniq', 'bold')} unique masks / {_c('dist', 'bold')} "
+            f"mean pairwise mask Jaccard distance ({_c('0=all identical', 'red')}) / "
+            f"{_c('elite_overlap', 'bold')} % of mask shared with best / "
+            f"{_c('>90%', 'bold')} # genomes \u226590% overlapping best"
+        )
+        _emit_line(
+            f"  {_c('ROT', 'magenta')}: {_c('n', 'bold')} mean rotations / "
+            f"{_c('pairs', 'bold')} unique rotation pairs / "
+            f"{_c('chans', 'bold')} mean channels touched"
+        )
+        _emit_line(
+            f"  {_c('pruned', 'bold')} X/512  unique deleted channels touched "
+            f"({_c('low \u2192 red', 'red')} = rotations miss the deleted set)"
+        )
+        _emit_line(
+            f"  {_c('cov', 'bold')}  deleted-channel coverage % "
+            f"(want \u2265450-512/512, not {_c('13/512', 'red')}) / "
+            f"{_c('eff', 'bold')} effective cross-boundary rotations / "
+            f"{_c('dist', 'bold')} rotation Jaccard dist to best / "
+            f"{_c('lineage', 'bold')} % descended from best"
+        )
         _emit_line("")
     except Exception:
         pass
@@ -314,7 +358,11 @@ def ratchet_search(
         # the elite-lineage fraction over the last ``lineage_lookback`` gens.
         parent_maps: list[dict[int, set[int]]] = []
 
+        # print the legend once, before the first generation
+        _emit_legend(tag=_variant_tag(variant))
+
         for gen in range(gen_limit):
+            t_gen = time.time()      # for the per-generation time on the log line
             # NEW random batch every generation, same for all candidates.
             batch = streamer.batch(fit_batch, seq_len)
             ref = baseline_logits(pm, [batch], seq_len)[0]
@@ -423,6 +471,7 @@ def ratchet_search(
                     best.removed, div, tag=_variant_tag(variant),
                     prev_arch_kl=_prev, pop_size=len(population),
                     debug_every=getattr(cfg.search, "diversity_debug_every", 10),
+                    gen_time=(time.time() - t_gen),
                 )
                 _last_arch[target] = av.validated_kl if av else float("nan")
             except Exception:

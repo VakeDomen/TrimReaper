@@ -255,3 +255,27 @@ def test_danger_styles_and_colored_output():
     assert "\x1b[34m" in out                   # blue MASK
     assert "\x1b[35m" in out                   # magenta ROT
     assert "\x1b[31m" in out                   # red (collapsed mask dist/overlap)
+
+
+def test_emit_legend_fenced_and_explains_terms():
+    """The legend (printed once before gen 0) must be fenced by blank lines and
+    explain the line-1 / MASK / ROT terms in plain text."""
+    import contextlib
+    from io import StringIO
+
+    from trimreaper.pipeline import _emit_legend
+
+    buf = StringIO()
+    with contextlib.redirect_stdout(buf):
+        _emit_legend(tag="GA+rot")
+    raw = buf.getvalue()
+    lines = raw.splitlines()
+    # fenced: starts with a blank line, and the content ends before a blank
+    assert lines[0] == ""
+    assert "legend" in lines[1]
+    assert "MASK" in raw
+    assert "ROT" in raw
+    assert "fit" in raw and "arch" in raw and "lineage" in raw
+    assert "Jaccard" in raw
+    # ends with a blank line before the next block
+    assert raw.endswith("\n\n")

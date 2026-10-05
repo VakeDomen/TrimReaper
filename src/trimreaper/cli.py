@@ -306,6 +306,7 @@ def cmd_rotsearch(args) -> int:
     sweep = cfg.search.rotation_sweep or [cfg.genome.rotations_per_removed]
     budget_into_rot = cfg.genome.rotations_per_removed
     max_rot = cfg.genome.max_rotations
+    min_floor = cfg.genome.min_rotations
     results = {"baseline": {"val": base_val, "test": base_test}}
     for rpr in sweep:
         cfg.search.freeze_mask = True
@@ -314,7 +315,9 @@ def cmd_rotsearch(args) -> int:
         cfg.search.max_target = target  # single fixed level
         cfg.genome.rotations_per_removed = rpr
         cfg.genome.max_rotations = max(1, int(rpr * target))
-        cfg.genome.min_rotations = 1
+        # keep the evolvable-length floor (min_rotations default = 256), capped
+        # so it never exceeds this budget's ceiling.
+        cfg.genome.min_rotations = min(min_floor, cfg.genome.max_rotations)
         log(f"--- budget {rpr} rot/removed (max_rot={cfg.genome.max_rotations}, "
             f"rounds={cfg.search.rounds}) ---")
 
@@ -333,19 +336,23 @@ def cmd_rotsearch(args) -> int:
             "n_rot": cov["n_rot"],
             "unique_channels_touched": cov["unique_channels_touched"],
             "unique_pruned_touched": cov["unique_pruned_touched"],
+            "effective_rotations": cov["effective_rotations"],
+            "cross_boundary_rotations": cov["cross_boundary_rotations"],
+            "deleted_channel_coverage": round(cov["deleted_channel_coverage"], 4),
             "pruned_touch_frac": round(cov["unique_pruned_touched"] / max(1, target), 4),
             "val_kl": res.points[0].validated_kl if res.points else float("nan"),
             "test_kl": test_kl,
         }
         results[f"rot{rpr}"] = out
         log(f"budget {rpr}: val={out['val_kl']:.5f} test={out['test_kl']:.5f} "
-            f"| n_rot={out['n_rot']} touched={out['unique_channels_touched']} "
-            f"pruned-touched={out['unique_pruned_touched']} "
-            f"({out['pruned_touch_frac']*100:.0f}% of {target})")
+            f"| n_rot={out['n_rot']} eff={out['effective_rotations']} "
+            f"pruned-touched={out['unique_pruned_touched']}"
+            f" cov={out['deleted_channel_coverage']*100:.0f}%")
 
     # restore config fields for the report
     cfg.genome.rotations_per_removed = budget_into_rot
     cfg.genome.max_rotations = max_rot
+    cfg.genome.min_rotations = min_floor
     cfg.search.freeze_mask = False
 
     report = {

@@ -44,13 +44,14 @@ data:
   max_docs: 2000            # 0 = unlimited; caps CPU-bound wikitext tokenization
 
 genome:
-  min_rotations: 16                # floor on the rotation budget
-  max_rotations: 640               # hard ceiling (allows up to ~640 rotations)
-  rotations_per_removed: 0.5       # budget = clamp(0.5*target, 16, 640)
-                                   #   target=256 -> 128, 512 -> 256, 1024 -> 512
+  min_rotations: 256                # evolvable-length floor (reviewer: min 256)
+  max_rotations: 4096               # hard ceiling (allows up to 4096 rotations)
+  rotations_per_removed: 1.0        # budget = clamp(rpr*target, 256, 4096)
+                                    #   target=512 -> 512, 1024 -> 1024, 2048 -> 2048
+  initial_rotation_frac: 0.75       # initial genomes start near the budget, not the floor
   min_angle: -6.283185307179586    # +/- 2pi
   max_angle: 6.283185307179586
-  delete_survive_bias: 0.7         # rotate delete<->survive pairs (PLAN sec 6)
+  delete_survive_bias: 0.95         # STRONGLY prefer deleted<->kept (cross-boundary) rotations
 
 ga:
   population: 32            # candidates per generation (PLAN sec 7)

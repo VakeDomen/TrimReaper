@@ -95,19 +95,44 @@ def random_rotation_pair(width: int, genome: Genome, cfg: Config, rng: random.Ra
 
     Applies the delete<->survive bias from PLAN.md section 6: with probability
     ``genome.delete_survive_bias`` one endpoint comes from the to-delete set
-    and the other from the surviving (non-deleted) set.
+    and the other from the surviving (non-deleted) set. The bias is strong
+    (0.95 default) so most rotations genuinely perturb the removed subspace
+    rather than being kept<->kept.
     """
     surviving = [c for c in range(width) if c not in genome.pruned]
     deleted = list(genome.pruned)
     if rng.random() < cfg.genome.delete_survive_bias and deleted and surviving:
         a = rng.choice(deleted)
         b = rng.choice(surviving)
-    else:
-        a = rng.randrange(width)
-        b = rng.randrange(width)
+        return a, b
+    a = rng.randrange(width)
+    b = rng.randrange(width)
     if a == b:
         b = (b + 1) % width
     return a, b
+
+
+def replace_endpoint(width: int, genome: Genome, cfg: Config, rng: random.Random,
+                     keep: int) -> int:
+    """Pick a replacement endpoint for a rotation, biased cross-boundary.
+
+    When replacing one endpoint of an existing rotation, prefer (with
+    ``delete_survive_bias``) to draw the new endpoint from the OPPOSITE side of
+    the deleted/kept boundary relative to ``keep``, so the rotation keeps
+    perturbing the deleted subspace. ``keep`` is the endpoint being fixed.
+    """
+    keep_deleted = keep in genome.pruned
+    target_pool = ("surviving" if keep_deleted else "deleted")
+    surviving = [c for c in range(width) if c not in genome.pruned]
+    deleted = list(genome.pruned)
+    if rng.random() < cfg.genome.delete_survive_bias:
+        pool = surviving if target_pool == "surviving" else deleted
+        if pool:
+            return rng.choice(pool)
+    c = rng.randrange(width)
+    while c == keep:
+        c = rng.randrange(width)
+    return c
 
 
 def random_angle(cfg: Config, rng: random.Random) -> float:
@@ -139,8 +164,14 @@ def make_random_genome(cfg: Config, width: int, target: int, rng: random.Random,
         g.pruned = set(rng.sample(range(width), target))
 
     n_rot_max = rotation_budget(cfg, target)
-    if target > 0:
-        n_rot = rng.randint(min(cfg.genome.min_rotations, n_rot_max), n_rot_max)
+    if target > 0 and n_rot_max > 0:
+        # Start with a substantial rotation count near the budget (not the bare
+        # floor), so early evolution isn't artificially sparse. Initial genomes
+        # are uniform in [max(min_rotations, round(initial_frac*budget)), budget].
+        floor = getattr(cfg.genome, "initial_rotation_frac", 0.75)
+        lo = max(cfg.genome.min_rotations, int(floor * n_rot_max))
+        lo = min(lo, n_rot_max)
+        n_rot = rng.randint(lo, n_rot_max)
     else:
         n_rot = 0
     for _ in range(n_rot):
@@ -166,17 +197,13 @@ def mutate(cfg: Config, genome: Genome, width: int, target: int, rng: random.Ran
     if g.rotations and rng.random() < cfg.ga.replace_a_p:
         i = rng.randrange(len(g.rotations))
         rot = g.rotations[i]
-        a = rng.randrange(width)
-        while a == rot.b:
-            a = rng.randrange(width)
+        a = replace_endpoint(width, g, cfg, rng, keep=rot.b)
         g.rotations[i] = PairRotation(a, rot.b, rot.angle)
 
     if g.rotations and rng.random() < cfg.ga.replace_b_p:
         i = rng.randrange(len(g.rotations))
         rot = g.rotations[i]
-        b = rng.randrange(width)
-        while b == rot.a:
-            b = rng.randrange(width)
+        b = replace_endpoint(width, g, cfg, rng, keep=rot.a)
         g.rotations[i] = PairRotation(rot.a, b, rot.angle)
 
     if len(g.rotations) < rotation_budget(cfg, target) and rng.random() < cfg.ga.add_rotation_p:
@@ -264,14 +291,25 @@ def coverage_stats(genome: Genome, width: int | None = None) -> dict:
     freedom is being wasted outside the deleted subspace.
     """
     touched = set()
+    pruned = set(genome.pruned)
+    cross = 0                     # rotations whose endpoints straddle the boundary
     for r in genome.rotations:
+        if (r.a in pruned) != (r.b in pruned):
+            cross += 1
         touched.add(r.a)
         touched.add(r.b)
-    pruned = set(genome.pruned)
+    n_pruned = len(pruned)
+    up_touched = len(touched & pruned)
     return {
         "n_rot": len(genome.rotations),
         "unique_channels_touched": len(touched),
-        "unique_pruned_touched": len(touched & pruned),
+        "unique_pruned_touched": up_touched,
+        # effective rotation count = rotations that actually cross the deleted/kept
+        # boundary and can therefore move mass out of the removed subspace.
+        "effective_rotations": cross,
+        "cross_boundary_rotations": cross,
+        # fraction of the deleted set touched by at least one rotation (0..1).
+        "deleted_channel_coverage": (up_touched / n_pruned) if n_pruned else 0.0,
     }
 
 

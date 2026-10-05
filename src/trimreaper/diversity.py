@@ -154,19 +154,25 @@ def rotation_metrics(population, elite_rotations: Sequence) -> dict:
     unique_pairs: set[tuple[int, int]] = set()
     chan_counts: list[set[int]] = []
     pruned_counts: list[int] = []
+    cross_counts: list[int] = []
+    coverage: list[float] = []
     for g, rl in zip(population, rot_lists):
         pruned = _pruned_set(g)
         chans = set()
-        n_p = 0
+        n_cross = 0
         for r in rl:
             a, b = _norm_rot(r)
             unique_pairs.add(_norm_rot(r))
             chans.add(a)
             chans.add(b)
-            if a in pruned or b in pruned:
-                n_p += 1
+            if (a in pruned) != (b in pruned):   # crosses the deleted/kept boundary
+                n_cross += 1
         chan_counts.append(chans)
-        pruned_counts.append(n_p)
+        # bounded (<= len(pruned)) unique deleted channels touched per genome
+        pruned_counts.append(len(chans & pruned))
+        cross_counts.append(n_cross)
+        touched_pruned = len(chans & pruned)
+        coverage.append((touched_pruned / len(pruned)) if len(pruned) else 0.0)
 
     # rotation-pair Jaccard distance to elite (as unordered pair sets)
     elite_pairs = {_norm_rot(r) for r in elite_rotations}
@@ -190,6 +196,8 @@ def rotation_metrics(population, elite_rotations: Sequence) -> dict:
         "unique_pairs": len(unique_pairs),
         "mean_unique_channels_touched": statistics.mean(len(c) for c in chan_counts),
         "mean_pruned_channels_touched": statistics.mean(pruned_counts),
+        "mean_effective_rotations": statistics.mean(cross_counts),
+        "mean_deleted_channel_coverage": statistics.mean(coverage),
         "mean_rot_distance_to_elite": statistics.mean(d_elite),
         "angle_std": angle_std,
     }

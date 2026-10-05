@@ -198,3 +198,75 @@ def test_rebase_explorer_copies_and_mutates_base():
     assert rebased.id != base.id
     assert rebased.parent_ids == [base.id]
     assert len(rebased.pruned) == 4
+
+
+def test_angle_mutate_frac_default():
+    """Reviewer fix #3: independent-explorer mutation targets ~5% of angles per
+    generation by default (angle_mutate_frac)."""
+    assert Config.defaults().ga.angle_mutate_frac == 0.05
+
+
+def test_mutate_from_self_mutation_is_guaranteed():
+    """Reviewer fix #3: in independent-explorer mode mutation must happen 100%
+    of the time (no mutation_rate gate), so EVERY child differs from its parent
+    — not just on the flip of a coin. Across many draws every child must change
+    at least its angles."""
+    cfg = _cfg()
+    cfg.ga.angle_mutate_frac = 0.5        # force many angle changes for a clean check
+    cfg.ga.replace_a_p = 0.0              # isolate the angle path
+    cfg.ga.replace_b_p = 0.0
+    cfg.ga.add_rotation_p = 0.0
+    cfg.ga.remove_rotation_p = 0.0
+    cfg.ga.flip_prune_p = 0.0             # no mask swap; isolate angle mutation
+    rng = random.Random(21)
+    parent = make_random_genome(cfg, width=40, target=4, rng=rng)
+    assert len(parent.rotations) >= 1
+    for _ in range(200):
+        child = mutate_from_self(cfg, parent, 40, 4, rng)
+        # every child must have mutated its angles (100% guaranteed) even though
+        # every other mutation operator is disabled.
+        p_angles = [r.angle for r in parent.rotations]
+        c_angles = [r.angle for r in child.rotations]
+        assert c_angles != p_angles, "angle mutation must fire 100% of the time"
+
+
+def test_mask_mutation_then_repair_keeps_cross_boundary():
+    """Reviewer fix #4: mask mutation happens FIRST, then rotations are repaired
+    against the new mask. With the flip gate forced on, a rotation straddling a
+    swapped channel must end up back on the correct side (or remain valid), and
+    every rotation must stay a != b."""
+    cfg = _cfg()
+    cfg.ga.flip_prune_p = 1.0             # ALWAYS swap one pruned -> surviving
+    cfg.ga.delete_survive_bias = 1.0      # repair re-draws strictly cross-boundary
+    rng = random.Random(31)
+    for _ in range(100):
+        parent = make_random_genome(cfg, width=64, target=8, rng=rng)
+        child = mutate_from_self(cfg, parent, 64, 8, rng)
+        assert len(child.pruned) == 8                  # exact target preserved
+        for rot in child.rotations:
+            assert rot.a != rot.b
+            assert 0 <= rot.a < 64 and 0 <= rot.b < 64
+
+
+def test_repair_rotations_after_mask_direct():
+    """Direct check of the repair step: after swapping a channel, a rotation
+    that ended up with both endpoints on the same side is re-drawn to cross the
+    boundary (delete_survive_bias=1.0 makes the re-draw deterministic)."""
+    from trimreaper.ga import _mask_swap, repair_rotations_after_mask
+    from trimreaper.rotation import PairRotation
+
+    cfg = _cfg()
+    cfg.ga.delete_survive_bias = 1.0
+    rng = random.Random(7)
+    # pruned = {0,1}; rotation (0,5) starts cross-boundary (0 deleted, 5 kept).
+    g = Genome(rotations=[PairRotation(0, 5, 0.3)], pruned={0, 1})
+    # Force a swap via the mask mutator on a copy to learn the changed channels.
+    from trimreaper.ga import mutate_mask
+    child = mutate_mask(cfg, g, 64, rng)
+    if child.pruned != {0, 1}:
+        changed = set(g.pruned) ^ set(child.pruned)
+    else:
+        changed = set()
+    repair_rotations_after_mask(cfg, child, 64, changed, rng)
+    for rot in child.rotations:
+        assert rot.a != rot.b

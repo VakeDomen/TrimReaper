@@ -85,13 +85,17 @@ def make_orthogonal_matrix(width: int, rots: list[PairRotation], device=None, dt
         c = math.cos(ang)
         s = math.sin(ang)
         # Embed the 2x2 [[c, s], [-s, c]] block into rows/cols (a, b) by
-        # right-multiplying: new row_a = c row_a + s row_b and
-        #                     new row_b = -s row_a + c row_b.
-        Q = Q.clone()
-        row_a = c * Q[a] + s * Q[b]
-        row_b = -s * Q[a] + c * Q[b]
-        Q[a] = row_a
-        Q[b] = row_b
+        # right-multiplying: new row_a = c old_a + s old_b and
+        #                     new row_b = -s old_a + c old_b.
+        # IMPORTANT (perf): clone ONLY the two rows being changed, never the
+        # whole matrix. Rows a and b depend on each other's OLD values, so we
+        # snapshot them before writing either. This turns an O(width^2) full-Q
+        # clone per rotation into O(width) work per rotation — critical at
+        # 1000+ rotations on a 9728-wide MLP.
+        old_a = Q[a].clone()
+        old_b = Q[b].clone()
+        Q[a] = c * old_a + s * old_b
+        Q[b] = -s * old_a + c * old_b
     return Q
 
 

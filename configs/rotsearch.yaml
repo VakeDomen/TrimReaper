@@ -57,9 +57,12 @@ ga:
   elitism: 2
   tournament_size: 2          # for REBASING a stuck explorer (best of k bases)
   fail_limit: 5              # gens without beating the global elite before a re-base
+  # LEGACY-ONLY: used only by the retired crossover path (unit tests). The
+  # independent-explorer search ignores it — mutation happens 100% of the time.
   mutation_rate: 0.8
   add_rotation_p: 0.15
   remove_rotation_p: 0.10
+  angle_mutate_frac: 0.05    # GUARANTEED ~5% of rotation angles mutated every gen
   angle_mutate_p: 0.5
   angle_mutate_std: 0.15
   large_angle_p: 0.05

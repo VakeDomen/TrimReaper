@@ -377,8 +377,6 @@ def ratchet_search(
             t_gen = time.time()      # for the per-generation time on the log line
             # NEW random batch every generation, same for all candidates.
             batch = streamer.batch(fit_batch, seq_len)
-            ref = baseline_logits(pm, [batch], seq_len)[0]
-            ref_safe = ref.clone() if ref is not None else None
 
             # ---- evaluate every explorer's CURRENT genome on today's batch.
             # The global-elite reference (if any) is evaluated in the SAME call
@@ -390,17 +388,25 @@ def ratchet_search(
             have_elite = global_elite is not None
             if have_elite:
                 eval_genomes = [global_elite.genome] + eval_genomes
-            if ref_safe is not None and cfg.search.use_fast_eval:
-                # fast path: cache the pre-MLP prefix once, then score ALL
+            if cfg.search.use_fast_eval:
+                # fast path: cache the pre-MLP prefix ONCE, then score ALL
                 # genomes in ONE batched tail forward (no weight mutation).
+                # build_cache() itself performs the single pristine full-model
+                # forward and stores ref_logits, so we SKIP baseline_logits()
+                # entirely (reviewer fix #5 — one forward per generation, not 2).
                 from .fast_eval import build_cache, eval_genomes_batched
 
                 cache = build_cache(pm, batch, layer, seq_len)
+                ref_safe = None   # fast path compares against cache.ref_logits internally
                 kls = eval_genomes_batched(
                     cache, pm, layer, eval_genomes, seq_len,
                     chunk=cfg.search.fast_eval_chunk,  # 0 = auto-size from free VRAM
                 )
             else:
+                # slow path: pristine baseline on this batch, then per-candidate
+                # weight-rotation + masked forward.
+                ref = baseline_logits(pm, [batch], seq_len)[0]
+                ref_safe = ref.clone() if ref is not None else None
                 kls = [
                     evaluate_candidate(
                         pm, batch, ref_safe, layer,
@@ -433,17 +439,23 @@ def ratchet_search(
                 for ind in population:
                     ind.fail_count = 0
             else:
+                # Fix #2: find ALL candidates that beat the old elite on this
+                # same batch and reset their fail counters, then promote only
+                # the SINGLE best of them. We must NOT let the last-beater
+                # overwrite the elite, or a later (worse) winner could displace
+                # an earlier (better) one.
+                beaters = [ind for ind in population if ind.kl < elite_kl]
                 for ind in population:
                     if ind.kl < elite_kl:
-                        # candidate beat the elite on the SAME batch -> new elite,
-                        # and this explorer has proven itself: reset its counter.
-                        global_elite = Individual(
-                            genome=clone_genome(ind.genome, keep_id=True),
-                            fitness=ind.fitness, kl=ind.kl, removed=ind.removed,
-                        )
                         ind.fail_count = 0
                     else:
                         ind.fail_count += 1
+                if beaters:
+                    best_beater = min(beaters, key=lambda i: i.fitness)
+                    global_elite = Individual(
+                        genome=clone_genome(best_beater.genome, keep_id=True),
+                        fitness=best_beater.fitness, kl=best_beater.kl, removed=best_beater.removed,
+                    )
 
             # ---- stable objective: validate top-K on the VALIDATION set ----
             # NOTE: the archive decision MUST use ONE authoritative evaluator so
@@ -537,11 +549,27 @@ def ratchet_search(
                          diversity=div)
 
             # ---- evolve each explorer ONCE for the next generation ----
-            # Re-based (stuck) explorers already carry a fresh mutated copy of a
-            # tournament-selected base; everyone else self-mutates from itself.
-            for ind in population:
+            # Fix #1: decide ALL rebases BEFORE mutating anyone. Re-basing one
+            # explorer mutates it and resets its fitness to inf in-place; if we
+            # tournament-selected later, we'd draw from an already-half-mutated
+            # population. So snapshot the evaluated population (frozen fitness +
+            # pre-evolution genomes) and use THAT snapshot for every tournament,
+            # then mutate/re-base everybody.
+            snapshot = [
+                Individual(genome=ind.genome, fitness=ind.fitness, kl=ind.kl,
+                           removed=ind.removed, fail_count=ind.fail_count)
+                for ind in population
+            ]
+            rebase_base_of: dict[int, Individual] = {}
+            for i, ind in enumerate(population):
                 if ind.fail_count >= fail_limit:
-                    base = tournament_parent(population, tsize, rng)
+                    rebase_base_of[i] = tournament_parent(snapshot, tsize, rng)
+
+            for i, ind in enumerate(population):
+                if i in rebase_base_of:
+                    # a stuck explorer: copy the frozen-snapshot-selected base
+                    # and mutate it to start a fresh search path.
+                    base = rebase_base_of[i]
                     ind.genome = rebase_explorer(
                         cfg, base.genome, width, target, rng, fixed_pruned)
                     if not use_rotations:

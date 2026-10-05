@@ -254,20 +254,141 @@ def clone_genome(genome: Genome, keep_id: bool = True) -> Genome:
     return g
 
 
+def _mask_swap(cfg: Config, genome: Genome, width: int, rng: random.Random) -> Optional[set]:
+    """Swap one pruned channel for one surviving (if the flip gate fires).
+
+    Returns the set of channel indices whose pruned/kept STATUS changed
+    (the dropped + added channels), or an empty set when nothing changed. The
+    caller uses this to repair rotations that now point at flipped channels.
+    """
+    changed: set = set()
+    if rng.random() < cfg.ga.flip_prune_p and genome.pruned:
+        drop = rng.choice(list(genome.pruned))
+        survivors = [c for c in range(width) if c not in genome.pruned]
+        if survivors:
+            add = rng.choice(survivors)
+            genome.pruned.remove(drop)
+            genome.pruned.add(add)
+            changed.update((drop, add))
+    return changed
+
+
+def repair_rotations_after_mask(cfg: Config, genome: Genome, width: int,
+                                changed: set, rng: random.Random) -> None:
+    """Repair rotations AFTER a mask mutation (reviewer fix #4).
+
+    A mask swap changes which channels are deleted/kept, so a rotation that
+    crossed the deleted/kept boundary before may now sit entirely on one side
+    (or become degenerate a==b). For every rotation touching a changed-status
+    channel, if both endpoints now share the same deleted-state, re-draw one
+    endpoint (cross-boundary biased) to restore the rotation's coverage of the
+    removed subspace. Also guarantees a != b on every rotation.
+    """
+    for i, rot in enumerate(genome.rotations):
+        a, b = rot.a, rot.b
+        if a == b:
+            # degenerate pair (shouldn't normally happen); re-pick b
+            genome.rotations[i] = PairRotation(a, replace_endpoint(width, genome, cfg, rng, keep=a), rot.angle)
+            continue
+        if (a in changed) or (b in changed):
+            a_del = a in genome.pruned
+            b_del = b in genome.pruned
+            if a_del == b_del:
+                # both endpoints now on the same side of the boundary -> restore
+                # the cross-boundary intent by re-drawing the changed endpoint.
+                if a in changed and b not in changed:
+                    a = replace_endpoint(width, genome, cfg, rng, keep=b)
+                else:
+                    b = replace_endpoint(width, genome, cfg, rng, keep=a)
+                if a == b:
+                    continue  # keep degenerate resolution from a width-1 pool; skip
+                genome.rotations[i] = PairRotation(a, b, rot.angle)
+
+
+def _mutate_angles_guaranteed(cfg: Config, genome: Genome, rng: random.Random,
+                              frac: Optional[float] = None) -> None:
+    """Mutate ~``frac`` (default cfg.ga.angle_mutate_frac, 5%) of rotation angles.
+
+    This is the GUARANTEED mutation: with independent-explorer mode, mutation
+    happens 100% of the time (reviewer fix #3). Each selected angle gets the
+    small Gaussian change (``angle_mutate_std``), with an occasional large jump
+    (``large_angle_p`` / ``large_angle_std``) for exploration. Mutating only one
+    angle per generation on ~440-1000 rotations is nearly a no-op, so we always
+    touch a meaningful fraction.
+    """
+    n = len(genome.rotations)
+    if n == 0:
+        return
+    frac = frac if frac is not None else getattr(cfg.ga, "angle_mutate_frac", 0.05)
+    n_angle = max(1, min(n, int(round(frac * n))))
+    for i in rng.sample(range(n), n_angle):
+        rot = genome.rotations[i]
+        if rng.random() < cfg.ga.large_angle_p:
+            new_angle = rot.angle + rng.gauss(0, cfg.ga.large_angle_std)
+        else:
+            new_angle = rot.angle + rng.gauss(0, cfg.ga.angle_mutate_std)
+        genome.rotations[i] = PairRotation(rot.a, rot.b, new_angle)
+
+
+def _mutate_explorer_core(cfg: Config, genome: Genome, width: int, target: int,
+                          rng: random.Random,
+                          fixed_pruned: Optional[set] = None) -> Genome:
+    """Independent-explorer mutation engine (reviewer fixes #3 and #4).
+
+    Order (fix #4 — mask FIRST, then repair, then angles/endpoints/add/remove):
+        1. copy the parent genome
+        2. mutate the pruned mask (probabilistic swap)
+        3. REPAIR rotations against the new mask (fix lost cross-boundary intent)
+        4. mutate angles (GUARANTEED, ~5% every generation), then the
+           probabilistic endpoint / add / remove operators on top.
+
+    In rotation-isolation mode (``fixed_pruned``), the mask is frozen and only
+    rotations evolve (mask mutation is skipped entirely).
+    """
+    g = Genome(rotations=list(genome.rotations), pruned=set(genome.pruned))
+    changed: set = set()
+    if fixed_pruned is not None:
+        g.pruned = set(fixed_pruned)
+    else:
+        changed = _mask_swap(cfg, g, width, rng)
+        g.with_target_pruned(target, rng, width)   # keep exactly `target` removed
+    # repair rotations against any mask change, BEFORE touching angles.
+    repair_rotations_after_mask(cfg, g, width, changed, rng)
+    # guaranteed angle mutation (100% of the time).
+    _mutate_angles_guaranteed(cfg, g, rng)
+    # probabilistic extra mutations on top.
+    if g.rotations and rng.random() < cfg.ga.replace_a_p:
+        i = rng.randrange(len(g.rotations))
+        rot = g.rotations[i]
+        a = replace_endpoint(width, g, cfg, rng, keep=rot.b)
+        g.rotations[i] = PairRotation(a, rot.b, rot.angle)
+    if g.rotations and rng.random() < cfg.ga.replace_b_p:
+        i = rng.randrange(len(g.rotations))
+        rot = g.rotations[i]
+        b = replace_endpoint(width, g, cfg, rng, keep=rot.a)
+        g.rotations[i] = PairRotation(rot.a, b, rot.angle)
+    if len(g.rotations) < rotation_budget(cfg, target) and rng.random() < cfg.ga.add_rotation_p:
+        a, b = random_rotation_pair(width, g, cfg, rng)
+        g.rotations.append(PairRotation(a, b, random_angle(cfg, rng)))
+    if g.rotations and rng.random() < cfg.ga.remove_rotation_p:
+        del g.rotations[rng.randrange(len(g.rotations))]
+    if fixed_pruned is not None:
+        g.pruned = set(fixed_pruned)   # rotations evolve; mask stays frozen
+    g.id = _next_genome_id()
+    return g
+
+
 def mutate_from_self(cfg: Config, genome: Genome, width: int, target: int,
                      rng: random.Random, fixed_pruned: Optional[set] = None) -> Genome:
     """Independent-explorer evolution: a candidate mutates ONLY from itself.
 
     No crossover, no other parent. The child inherits both the rotations and
-    the pruned mask of its sole self-parent, then every mutation operator
-    (angle / replace-endpoint / add / remove / mask-flip) applies. Returns the
-    new genome with a fresh identity whose single parent is ``genome``.
+    the pruned mask of its sole self-parent, then the FULL explorer mutation
+    (mask-first + repair + guaranteed ~5% angle mutation + probabilistic
+    endpoint/add/remove) applies. Returns the new genome with a fresh identity
+    whose single parent is ``genome``.
     """
-    g = mutate(cfg, genome, width, target, rng, fixed_pruned)
-    g = mutate_mask(cfg, g, width, rng, fixed_pruned)
-    if fixed_pruned is None:
-        g.with_target_pruned(target, rng, width)
-    g.id = _next_genome_id()
+    g = _mutate_explorer_core(cfg, genome, width, target, rng, fixed_pruned)
     g.parent_ids = [genome.id] if genome.id is not None else []
     return g
 
@@ -276,16 +397,13 @@ def rebase_explorer(cfg: Config, base: Genome, width: int, target: int,
                     rng: random.Random, fixed_pruned: Optional[set] = None) -> Genome:
     """Rebase a stuck explorer onto a tournament-selected base and mutate it.
 
-    The fresh genome copies ``base`` then mutates (single self-parent ``base``),
-    giving the rescued candidate a new path. Used only when a candidate has
-    failed ``cfg.ga.fail_limit`` consecutive generations without beating the
-    global elite.
+    The fresh genome copies ``base`` then runs the SAME guaranteed explorer
+    mutation (mask-first + repair + angle/endpoint/add/remove), giving the
+    rescued candidate a new path. Used only when a candidate has failed
+    ``cfg.ga.fail_limit`` consecutive generations without beating the global
+    elite.
     """
-    g = mutate(cfg, base, width, target, rng, fixed_pruned)
-    g = mutate_mask(cfg, g, width, rng, fixed_pruned)
-    if fixed_pruned is None:
-        g.with_target_pruned(target, rng, width)
-    g.id = _next_genome_id()
+    g = _mutate_explorer_core(cfg, base, width, target, rng, fixed_pruned)
     g.parent_ids = [base.id] if base.id is not None else []
     return g
 

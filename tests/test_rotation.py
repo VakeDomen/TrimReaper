@@ -64,6 +64,49 @@ def test_rotation_inverse_recovers_original():
         assert torch.allclose(params[k], orig[k], atol=1e-9)
 
 
+def test_make_orthogonal_matrix_is_orthogonal_by_rows():
+    """The Q builder must compose many Givens rotations into a single
+    ORTHOGONAL matrix — even after switching from a full-matrix clone to the
+    row-only clone (fix #6: clone just the two changed rows each rotation). Q^T Q
+    must equal I for a long rotation sequence."""
+    from trimreaper.rotation import PairRotation, make_orthogonal_matrix
+
+    width = 32
+    rots = [PairRotation(a=i, b=(i + 7) % width, angle=0.1 * i) for i in range(20)]
+    Q = make_orthogonal_matrix(width, rots, dtype=torch.float64)
+    assert Q.shape == (width, width)
+    gram = Q.t() @ Q
+    assert torch.allclose(gram, torch.eye(width, dtype=torch.float64), atol=1e-9)
+    # applying to a vector preserves its norm (rotation)
+    v = torch.randn(width, dtype=torch.float64)
+    assert torch.allclose(((v @ Q) ** 2).sum(), (v ** 2).sum(), atol=1e-9)
+
+
+def test_make_orthogonal_matches_reference_rows_only():
+    """Regression: the row-only clone optimization must reproduce the exact
+    matrix produced by a reference naive implementation (clone whole Q each
+    step), so identical rotations yield identical Q."""
+    import math
+
+    from trimreaper.rotation import PairRotation, make_orthogonal_matrix
+
+    width = 16
+    rots = [PairRotation(3, 10, 0.7), PairRotation(1, 15, -1.1), PairRotation(0, 7, 2.0)]
+
+    def reference(width, rots):
+        Q = torch.eye(width, dtype=torch.float64)
+        for r in rots:
+            c, s = math.cos(r.angle), math.sin(r.angle)
+            old = Q.clone()
+            Q[r.a] = c * old[r.a] + s * old[r.b]
+            Q[r.b] = -s * old[r.a] + c * old[r.b]
+        return Q
+
+    q_new = make_orthogonal_matrix(width, rots, dtype=torch.float64)
+    q_ref = reference(width, rots)
+    assert torch.allclose(q_new, q_ref, atol=1e-12)
+
+
 def test_rows_and_cols_transform_as_documented():
     """Verify rows rotate by R and columns by R^T, matching PLAN.md section 3."""
     from trimreaper.rotation import PairRotation, apply_pair_rotation, givens_matrix
@@ -90,6 +133,7 @@ def test_rows_and_cols_transform_as_documented():
     d = params["down_proj"]
     expected_cols = D[:, [3, 4]] @ R.t()
     assert torch.allclose(d[:, [3, 4]], expected_cols, atol=1e-9)
+
     from trimreaper.rotation import PairRotation, apply_rotation_sequence
 
     params = _make_mlp_tensors()

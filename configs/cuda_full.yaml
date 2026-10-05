@@ -61,9 +61,16 @@ ga:
   # generations without beating the global elite gets re-based (copy+mutate a
   # tournament-selected base) and starts a fresh search path.
   fail_limit: 5
+  # LEGACY-ONLY: used only by the retired crossover path (unit tests). The
+  # independent-explorer search ignores it — mutation happens 100% of the time.
   mutation_rate: 0.8
   add_rotation_p: 0.15
   remove_rotation_p: 0.10
+  # Independent-explorer mode: GUARANTEED fraction of rotation angles mutated
+  # EVERY generation (100% of the time). 5% -> ~22 angle changes at 440 rot,
+  # ~50 at 1000 rot. Each gets the small Gaussian change (angle_mutate_std)
+  # with an occasional large jump (large_angle_p / large_angle_std).
+  angle_mutate_frac: 0.05
   angle_mutate_p: 0.5
   angle_mutate_std: 0.15    # small Gaussian angle mutations
   large_angle_p: 0.05       # occasional large angle for exploration
@@ -77,9 +84,9 @@ search:
   # We are collecting the KL-vs-removed CURVE, NOT gatekeeping on epsilon yet.
   # Set epsilon high so every target level records instead of being rejected.
   epsilon: 0.5
-  rounds: 30                # generations at the fixed target (per GA method)
+  rounds: 20                # generations at the fixed target (per GA method)
   valid_best_k: 3           # top-K (by fitness) candidates validation-scored each gen
-  start_target: 512         # fixed level: delete 512/9728 channels (~5.3%)
+  start_target: 1024         # fixed level: delete 512/9728 channels (~5.3%)
   ratchet_step: 256         # unused while start==max; used only if ratcheting
   max_target: 1024           # == start_target => single fixed level, no ratchet
   penalty_scale: 10.0

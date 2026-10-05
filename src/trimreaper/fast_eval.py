@@ -76,10 +76,18 @@ def build_cache(pm: PrunedModel, batch: torch.Tensor, layer: int, seq_len: int) 
 
     Exactly one full-model forward runs here (also producing the reference the
     KL is measured against); every subsequent candidate eval reuses the cache.
+    The model is first reset to pristine/unmasked so ``ref_logits`` is always
+    the true baseline (the pipeline relies on this cache as its ONLY reference,
+    skipping the separate baseline forward).
     """
     model = pm.model
     layers = model.model.layers
     target_layer = layers[layer]
+
+    # Guarantee a pristine, unmasked baseline (fast path no longer calls
+    # baseline_logits(), which used to perform this reset).
+    pm.restore_all()
+    pm.clear_all_masks()
 
     capture: dict = {}
 

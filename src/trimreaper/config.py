@@ -96,10 +96,17 @@ class GaConfig:
     # consecutive generations without beating the global elite (same-batch KL)
     # is re-based onto a tournament-selected base and starts a fresh path.
     fail_limit: int = 5
+    # LEGACY-ONLY (used only by the retired crossover make_child_population, still
+    # exercised by unit tests). The independent-explorer path ignores it: mutation
+    # there happens 100% of the time via angle_mutate_frac.
     mutation_rate: float = 0.3
     add_rotation_p: float = 0.15
     remove_rotation_p: float = 0.10
-    angle_mutate_p: float = 0.5
+    # Independent-explorer mode: the fraction of rotation angles mutated EVERY
+    # generation (guaranteed, 100% of the time). Default 5% -> ~22 angle changes
+    # on a 440-rotation genome, ~50 on a 1000-rotation genome.
+    angle_mutate_frac: float = 0.05
+    angle_mutate_p: float = 0.5         # legacy-only (single-angle gate for `mutate`)
     angle_mutate_std: float = 0.15      # small Gaussian angle mutations
     large_angle_p: float = 0.05         # occasional large angle mutation
     large_angle_std: float = 1.0

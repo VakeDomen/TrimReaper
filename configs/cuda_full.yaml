@@ -53,10 +53,10 @@ genome:
   delete_survive_bias: 0.7         # rotate delete<->survive pairs (PLAN sec 6)
 
 ga:
-  population: 1000            # candidates per generation (PLAN sec 7)
+  population: 32            # candidates per generation (PLAN sec 7)
   elitism: 2
-  tournament_size: 4          # tournament selection: best of k for each parent
-  mutation_rate: 0.3
+  tournament_size: 2          # tournament selection: best of k for each parent
+  mutation_rate: 0.8
   add_rotation_p: 0.15
   remove_rotation_p: 0.10
   angle_mutate_p: 0.5
@@ -66,16 +66,18 @@ ga:
   replace_a_p: 0.2
   replace_b_p: 0.2
   flip_prune_p: 0.2
-  seed: 0
+  seed: 42
 
 search:
   # We are collecting the KL-vs-removed CURVE, NOT gatekeeping on epsilon yet.
   # Set epsilon high so every target level records instead of being rejected.
   epsilon: 0.5
-  rounds: 50                # generations at the fixed target (per GA method)
+  rounds: 30                # generations at the fixed target (per GA method)
   valid_best_k: 3           # top-K (by fitness) candidates validation-scored each gen
   start_target: 512         # fixed level: delete 512/9728 channels (~5.3%)
   ratchet_step: 256         # unused while start==max; used only if ratcheting
-  max_target: 512           # == start_target => single fixed level, no ratchet
+  max_target: 1024           # == start_target => single fixed level, no ratchet
   penalty_scale: 10.0
   archive_dir: "runs/archive"
+  use_fast_eval: true       # cache pre-MLP prefix + batched tail (major speedup)
+  fast_eval_chunk: 0        # 0 = AUTO-size tails from free VRAM (no OOM); or set 1/2/4/8 explicitly

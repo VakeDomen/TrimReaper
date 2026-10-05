@@ -1,0 +1,93 @@
+# TrimReaper rotation-isolation experiment config — Qwen3-4B-Base.
+#
+# Hypothesis to isolate: for a FIXED pruning mask, does evolving Givens
+# rotations (only) push the post-prune KL below the no-rotation baseline?
+# The reviewer's read: activation-magnitude one-shot pruning (~0.00249 val KL)
+# beats both GA variants (~0.004) even though GA is allowed to move both the
+# mask and the rotations. This experiment holds the mask constant so we can
+# measure whether rotation COVERAGE (which channels rotations touch) — not the
+# angle size — is what matters.
+#
+# Method: the 512-channel activation-magnitude mask is computed once on probe
+# batches and FROZEN (search.freeze_mask=true, search.frozen_pruned set at
+# runtime by cmd_rotsearch). The GA then optimizes ONLY the rotation set around
+# that fixed mask. The rotation BUDGET is swept: rotations-per-removed in
+# {0.5, 1, 2, 4}. Each archived genome reports:
+#   n_rot, unique_channels_touched, unique_pruned_touched, val_kl, test_kl
+#
+# Launch on the GPU machine (auto chunk sizing prevents the OOM you hit):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   .venv/bin/python -m trimreaper.cli --config configs/rotsearch.yaml rotsearch
+#
+# Note: cmd_rotsearch OVERRIDES frozen_pruned/start_target/max_target/
+# rotations_per_removed/max_rotations/min_rotations per budget at runtime, so
+# the search.* values below are the outer defaults; rotation_sweep drives the
+# actual budget sweep.
+
+model:
+  model_id: "Qwen/Qwen3-4B-Base"
+  dtype: "bfloat16"
+  device: "cuda"            # pinned to GPU — do not auto-fall back to CPU
+  low_cpu_mem_usage: true
+  layers: [18]              # single middle layer for the POC
+
+data:
+  dataset: "Salesforce/wikitext"
+  dataset_config: "wikitext-103-raw-v1"
+  split: "train"            # fitness pool (WikiText train)
+  seq_len: 256              # random contiguous token windows
+  fit_batch: 4              # 4 sequences x 256 tokens per fitness forward
+  holdout_seq: 128          # VALIDATION set (WikiText 'validation'; search records on it)
+  test_seq: 64              # untouched TEST set (WikiText 'test'; final report only)
+  num_workers: 2
+  seed: 0
+  max_docs: 2000            # 0 = unlimited
+
+genome:
+  min_rotations: 1                 # overridden to 1 at runtime for every budget
+  max_rotations: 2048              # overridden per budget = int(rpr*target)
+  rotations_per_removed: 1.0       # default when rotation_sweep is empty
+  min_angle: -6.283185307179586    # +/- 2pi
+  max_angle: 6.283185307179586
+  delete_survive_bias: 0.7         # rotate delete<->survive pairs
+
+ga:
+  population: 32
+  elitism: 2
+  tournament_size: 2
+  mutation_rate: 0.8
+  add_rotation_p: 0.15
+  remove_rotation_p: 0.10
+  angle_mutate_p: 0.5
+  angle_mutate_std: 0.15
+  large_angle_p: 0.05
+  large_angle_std: 1.0
+  replace_a_p: 0.2
+  replace_b_p: 0.2
+  flip_prune_p: 0.2
+  seed: 42
+
+search:
+  epsilon: 0.5
+  rounds: 15                # SHORT runs (10-20) — this is a budget sweep, not a full tune
+  valid_best_k: 3
+  start_target: 512         # fixed level: delete 512/9728 channels (~5.3%)
+  ratchet_step: 512
+  max_target: 512           # == start_target => single fixed level, no ratchet
+  penalty_scale: 10.0
+  archive_dir: "runs/archive"
+  use_fast_eval: true
+  fast_eval_chunk: 0        # 0 = AUTO-size from free VRAM (safe, no OOM)
+  freeze_mask: true         # cmd_rotsearch sets frozen_pruned at runtime
+  frozen_pruned: []         # filled by cmd_rotsearch with the amag[:512] mask
+  rotation_sweep: [0.5, 1.0, 2.0, 4.0]   # rotations-per-removed per budget
+  # Diversity instrumentation (GPU-free, printed each generation). Every
+  # generation logs mask metrics (unique_masks, mean pairwise Jaccard distance,
+  # dist-to-elite, elite-overlap histogram), rotation metrics (unique_pairs,
+  # channels/pruned touched, dist-to-elite, angle std), and lineage
+  # (fraction of the population whose ancestry reaches the current elite within
+  # lineage_lookback generations). The one scalar to plot alongside best KL is
+  # mean_mask_jaccard: if it collapses toward ~0 while fitness plateaus, that is
+  # premature convergence.
+  lineage_lookback: 5       # prior generations of parent links to walk for the elite-lineage fraction
+  diversity_debug_every: 10 # emit the verbose DBG line every N gen (0 = never)

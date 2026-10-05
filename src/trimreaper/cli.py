@@ -145,9 +145,12 @@ def cmd_run(args) -> int:
     log(f"data ready in {time.time()-t0:.1f}s ({len(val_batches)} val + {len(test_batches)} test batches)")
 
     def _progress(tag: str, eps: float):
-        def cb(target, gen, best_kl, removed, arch_kl=float("nan")):
-            a = f" arch_kl={arch_kl:.5f}" if arch_kl == arch_kl else ""
-            print(f"[{tag}] target={target:5d} gen={gen:3d} best_kl={best_kl:.5f} removed={removed}  (eps={eps}){a}", flush=True)
+        # The pipeline now emits the full compact per-generation block itself
+        # (fit/arch + MASK + ROT + periodic DBG), including the "GA+rot" /
+        # "GA-norot" tag derived from the variant label. This callback is kept
+        # for API compatibility but prints nothing, avoiding a duplicate line.
+        def cb(target, gen, best_kl, removed, arch_kl=float("nan"), diversity=None):
+            return
         return cb
 
     log(f"phase 1/3: GA-with-rotations on layer {layer}...")
@@ -223,6 +226,8 @@ def _write_run_report(run_dir, cfg, res_rot, res_norot, baselines) -> str:
     import time as _time
 
     def _pt(p):
+        from .ga import coverage_stats
+
         return {
             "removed": p.removed,
             "kl": p.kl,
@@ -230,6 +235,7 @@ def _write_run_report(run_dir, cfg, res_rot, res_norot, baselines) -> str:
             "test_kl": p.test_kl,
             "rotations": [r.to_tuple() for r in p.genome.rotations],
             "pruned": sorted(p.genome.pruned),
+            **coverage_stats(p.genome),
         }
 
     report = {
@@ -247,6 +253,117 @@ def _write_run_report(run_dir, cfg, res_rot, res_norot, baselines) -> str:
     with open(report_path, "w") as fh:
         json.dump(report, fh, indent=2)
     return report_path
+
+
+def cmd_rotsearch(args) -> int:
+    """Rotation-isolation experiment.
+
+    Freeze the activation-magnitude pruning mask and optimize ONLY rotations
+    around it, sweeping the rotation budget (rotations per removed channel).
+    For each budget this asks: can basis rotation push a good fixed mask's KL
+    below its no-rotation baseline?  Logs val/test KL plus rotation coverage
+    (n_rot / unique channels touched / unique PRUNED channels touched).
+    """
+    import time
+
+    def log(msg: str) -> None:
+        print(f"[rotsearch] {msg}", flush=True)
+
+    cfg = _load_config(args)
+    run_dir = _make_run_dir(cfg, getattr(args, "tag", "") or "")
+    log(f"run outputs -> {run_dir}")
+    t0 = time.time()
+
+    from .baselines import activation_magnitude_ranking
+    from .data import WikiTextStreamer
+    from .evaluate import evaluate_genome_on_set, evaluate_pruned_on_set
+    from .ga import coverage_stats
+    from .pipeline import ratchet_search
+
+    pm = load_pruned_model(cfg)
+    layer = cfg.model.layers[0]
+    streamer = WikiTextStreamer(cfg)
+    val_batches = streamer.holdout_batches()
+    test_batches = streamer.test_batches()
+    seq_len = cfg.data.seq_len
+    target = cfg.search.start_target
+    width = pm.pristine[layer]["up_proj"].shape[0]
+
+    # 1) activation-magnitude mask (freeze): delete the target smallest |act| channels
+    probe = [streamer.batch(cfg.data.fit_batch, seq_len) for _ in range(4)]
+    amag = activation_magnitude_ranking(pm, layer, probe, seq_len)
+    if target > len(amag):
+        target = len(amag)
+    frozen = sorted(amag[:target])
+    log(f"activation-magnitude mask frozen: {target}/{width} channels removed")
+
+    # 2) no-rotation baseline on the frozen mask (the number to beat)
+    base_val = evaluate_pruned_on_set(pm, val_batches, layer, frozen, seq_len)
+    base_test = evaluate_pruned_on_set(pm, test_batches, layer, frozen, seq_len)
+    log(f"frozen-mask no-rotation baseline: val_kl={base_val:.5f} test_kl={base_test:.5f}")
+
+    # 3) rotation-budget sweep around the frozen mask
+    sweep = cfg.search.rotation_sweep or [cfg.genome.rotations_per_removed]
+    budget_into_rot = cfg.genome.rotations_per_removed
+    max_rot = cfg.genome.max_rotations
+    results = {"baseline": {"val": base_val, "test": base_test}}
+    for rpr in sweep:
+        cfg.search.freeze_mask = True
+        cfg.search.frozen_pruned = frozen
+        cfg.search.start_target = target
+        cfg.search.max_target = target  # single fixed level
+        cfg.genome.rotations_per_removed = rpr
+        cfg.genome.max_rotations = max(1, int(rpr * target))
+        cfg.genome.min_rotations = 1
+        log(f"--- budget {rpr} rot/removed (max_rot={cfg.genome.max_rotations}, "
+            f"rounds={cfg.search.rounds}) ---")
+
+        res = ratchet_search(
+            pm, cfg, layer, streamer, val_batches, use_rotations=True,
+            progress=None, archive_dir=None, variant=f"rot{rpr}",
+        )
+        if res.best_genome is None:
+            log(f"budget {rpr}: no archived genome")
+            continue
+        bg = res.best_genome
+        test_kl = evaluate_genome_on_set(pm, test_batches, layer, bg, seq_len)
+        cov = coverage_stats(bg)
+        out = {
+            "ratio": rpr,
+            "n_rot": cov["n_rot"],
+            "unique_channels_touched": cov["unique_channels_touched"],
+            "unique_pruned_touched": cov["unique_pruned_touched"],
+            "pruned_touch_frac": round(cov["unique_pruned_touched"] / max(1, target), 4),
+            "val_kl": res.points[0].validated_kl if res.points else float("nan"),
+            "test_kl": test_kl,
+        }
+        results[f"rot{rpr}"] = out
+        log(f"budget {rpr}: val={out['val_kl']:.5f} test={out['test_kl']:.5f} "
+            f"| n_rot={out['n_rot']} touched={out['unique_channels_touched']} "
+            f"pruned-touched={out['unique_pruned_touched']} "
+            f"({out['pruned_touch_frac']*100:.0f}% of {target})")
+
+    # restore config fields for the report
+    cfg.genome.rotations_per_removed = budget_into_rot
+    cfg.genome.max_rotations = max_rot
+    cfg.search.freeze_mask = False
+
+    report = {
+        "run_dir": run_dir,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "target": target,
+        "frozen_pruned": frozen,
+        "results": results,
+        "config": _config_to_dict(cfg),
+    }
+    import json
+
+    report_path = os.path.join(run_dir, "rotsearch_results.json")
+    with open(report_path, "w") as fh:
+        json.dump(report, fh, indent=2)
+    log(f"results saved -> {report_path}")
+    log(f"DONE in {time.time()-t0:.1f}s")
+    return 0
 
 
 def cmd_baselines(args) -> int:
@@ -317,6 +434,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--tag", default="", help="optional suffix for the dated run folder")
     _add_override_args(r)
     r.set_defaults(func=cmd_run)
+
+    rs = sub.add_parser("rotsearch", help="rotation-isolation search: freeze the "
+                                          "activation-magnitude mask, optimize rotations only")
+    rs.add_argument("--layers", default=None, help="comma-separated layer indices")
+    rs.add_argument("--tag", default="", help="optional suffix for the dated run folder")
+    _add_override_args(rs)
+    rs.set_defaults(func=cmd_rotsearch)
 
     b = sub.add_parser("baselines", help="compute one-shot baseline curves")
     b.add_argument("--layers", default=None, help="comma-separated layer indices")

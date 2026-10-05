@@ -109,6 +109,21 @@ class SearchConfig:
     max_target: int = 0             # 0 = unlimited
     penalty_scale: float = 10.0     # strong penalty for exceeding epsilon
     archive_dir: str = "runs/archive"
+    use_fast_eval: bool = True      # cache the pre-MLP prefix + run one batched tail
+    fast_eval_chunk: int = 0        # tails per tail-forward; 0 = AUTO-size from free VRAM (safe)
+    # Rotation-isolation experiment: freeze a fixed pruning mask and let the GA
+    # optimize ONLY rotations around it.
+    freeze_mask: bool = False       # when True, the pruned mask is fixed
+    frozen_pruned: list[int] = field(default_factory=list)  # the fixed mask (channel indices)
+    # rotation-budget sweep (rotations per removed channel) for rotsearch, e.g.
+    # [0.5, 1.0, 2.0, 4.0]. Empty = run a single budget from rotations_per_removed.
+    rotation_sweep: list = field(default_factory=list)
+    # Diversity instrumentation: how many prior generations of parent links to
+    # walk when computing the "fraction descended from current elite" metric.
+    lineage_lookback: int = 5
+    # Emit the verbose per-generation DBG line (overlap histogram / angle_std
+    # / elite dist range) every N generations (0 = never).
+    diversity_debug_every: int = 10
 
 
 @dataclass

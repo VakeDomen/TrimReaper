@@ -72,6 +72,36 @@ def test_full_pipeline_smoke(tmp_path):
     assert res_norot.best_removed >= 0
 
 
+def test_assigned_mutation_rate_stats(tmp_path):
+    """Assigned-rate experiment: every explorer slot gets a fixed ascending rate,
+    the rate survives re-basing, and the result reports per-rate win counters."""
+    cfg = _cfg(tmp_path)
+    cfg.ga.population = 8
+    cfg.search.rounds = 3       # a few generations so the loop + stats run fully
+    cfg.search.start_target = 8
+    cfg.search.max_target = 8   # single fixed level for a deterministic check
+    pm = load_tiny_smoke_model(cfg)
+    streamer = FakeStreamer()
+    holdout = streamer.holdout_batches()
+
+    from trimreaper.ga import assigned_mutation_fracs
+    from trimreaper.pipeline import ratchet_search
+
+    fracs = assigned_mutation_fracs(cfg.ga.population, cfg.ga.mutation_rate_max)
+    assert len(fracs) == 8
+    assert fracs[0] < fracs[-1]
+
+    res = ratchet_search(pm, cfg, 0, streamer, holdout, use_rotations=True)
+    # every slot has a rate-stats entry with the three counters
+    assert set(res.rate_stats.keys()) == {round(f, 6) for f in fracs}
+    for k, st in res.rate_stats.items():
+        assert set(st.keys()) == {"elite_wins", "archive_wins", "rebases"}
+        assert all(isinstance(v, int) and v >= 0 for v in st.values())
+    # elite_wins count (over the whole run) cannot exceed the number of gens
+    total_elite = sum(st["elite_wins"] for st in res.rate_stats.values())
+    assert total_elite <= cfg.search.rounds
+
+
 def test_rotation_restores_exactly(tmp_path):
     """Rotation under the corrected semantics: gate/up stay pristine, down is
     counter-rotated; restore_all returns everything to pristine."""

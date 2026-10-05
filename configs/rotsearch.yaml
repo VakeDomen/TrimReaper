@@ -62,7 +62,11 @@ ga:
   mutation_rate: 0.8
   add_rotation_p: 0.15
   remove_rotation_p: 0.10
-  angle_mutate_frac: 0.05    # GUARANTEED ~5% of rotation angles mutated every gen
+  # ASSIGNED-RATE experiment: each explorer slot gets a FIXED ascending rate
+  # (i+1)/population*rate_max -> 1%,2%,...,32% at pop 32. Attached to the slot,
+  # survives re-basing; the end report shows which rates win.
+  mutation_rate_max: 0.32
+  angle_mutate_frac: 0.05    # fallback only when no per-explorer rate is supplied
   angle_mutate_p: 0.5
   angle_mutate_std: 0.15
   large_angle_p: 0.05

@@ -35,6 +35,7 @@ from .ga import (
     GARandom,
     Genome,
     Individual,
+    assigned_mutation_fracs,
     clone_genome,
     coverage_stats,
     fitness_value,
@@ -67,6 +68,9 @@ class SearchResult:
     best_removed: int = 0
     n_generations: int = 0
     path: str = ""
+    # Per-assigned-mutation-rate statistics for this whole search (one variant):
+    #   rate (float) -> {"elite_wins", "archive_wins", "rebases"}.
+    rate_stats: dict = field(default_factory=dict)
 
 
 def _intermediate_size(pm: PrunedModel, layer: int) -> int:
@@ -175,9 +179,38 @@ def _danger(v, low_thresholds=None, high_thresholds=None):
     return ""
 
 
+def _fmt_mut_line(winner_frac, rate_stats: dict) -> str:
+    """Format the per-generation MUT line (assigned-mutation-rate tracking).
+
+    When an explorer became the new elite this generation:
+        MUT winner=17%  elite_wins=3  archive_wins=1
+    (winner's cumulative counts). Otherwise:
+        MUT winner=—  top_rates=17%:3  9%:2  24%:2
+    (top-3 rates by elite_wins). Best-effort; never raises.
+    """
+    try:
+        def _pct(f):
+            return int(round(f * 100.0))
+        if winner_frac is not None:
+            k = round(winner_frac, 6)
+            st = rate_stats.get(k, {})
+            return (f"  {_c('MUT', 'bold')}  winner={_c(f'{_pct(winner_frac)}%', 'green')}"
+                    f"  elite_wins={st.get('elite_wins', 0)}  archive_wins={st.get('archive_wins', 0)}")
+        ranked = sorted(
+            ((k, st.get("elite_wins", 0)) for k, st in rate_stats.items()),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        top = [f"{_pct(k)}%:{w}" for k, w in ranked[:3] if w > 0]
+        if not top:
+            return f"  {_c('MUT', 'bold')}  winner=—"
+        return f"  {_c('MUT', 'bold')}  winner=—  top_rates={_c(' '.join(top), 'dim')}"
+    except Exception:
+        return ""
+
+
 def _emit_generation(target, gen, total, best_kl, arch_kl, removed, div,
                      tag="GA", prev_arch_kl=None, pop_size=0, debug_every=10,
-                     gen_time=0.0):
+                     gen_time=0.0, mut=None):
     """Emit the reviewer's compact per-generation log block:
         1. is fitness/archive improving?
         2. is the pruning population collapsing?
@@ -257,6 +290,12 @@ def _emit_generation(target, gen, total, best_kl, arch_kl, removed, div,
                 f"{_c('angle_std', 'dim')}={_fmt(r.get('angle_std'))}  "
                 f"{_c('elite_dist', 'dim')}={er}"
             )
+
+        # ---- assigned-mutation-rate line (which explorer rates are winning) ----
+        if mut:
+            line = _fmt_mut_line(mut.get("winner"), mut.get("rate_stats", {}))
+            if line:
+                _emit_line(line)
 
         # blank line between generations (easier to scan a long run)
         _emit_line("")
@@ -346,15 +385,25 @@ def ratchet_search(
     max_target = cfg.search.max_target if cfg.search.max_target > 0 else width
     max_target = min(max_target, width)
 
+    # Per-assigned-mutation-rate statistics for this WHOLE variant (accumulate
+    # across ratchet levels). Each explorer SLOT has a fixed rate (1%..32% by
+    # default); we count how often each rate produced an elite/archive win or
+    # got re-based. Keys are the assigned fracs (floats like 0.01..0.32).
+    rate_max = getattr(cfg.ga, "mutation_rate_max", 0.32)
+    rate_stats: dict[float, dict] = {}
+    for f in assigned_mutation_fracs(cfg.ga.population, rate_max):
+        rate_stats.setdefault(round(f, 6), {"elite_wins": 0, "archive_wins": 0, "rebases": 0})
+
     while target <= max_target:
         gen_limit = cfg.search.rounds if cfg.search.rounds > 0 else 10_000_000
         # --- build initial population for this target ---
         population: list[Individual] = []
-        for _ in range(cfg.ga.population):
+        fracs = assigned_mutation_fracs(cfg.ga.population, rate_max)
+        for i in range(cfg.ga.population):
             g = make_random_genome(cfg, width, target, rng, fixed_pruned)
             if not use_rotations:
                 g.rotations = []
-            population.append(Individual(genome=g))
+            population.append(Individual(genome=g, mutation_frac=fracs[i]))
 
         # rolling window of per-generation parent-link maps (newest last), for
         # the elite-lineage fraction over the last ``lineage_lookback`` gens.
@@ -428,13 +477,19 @@ def ratchet_search(
                 ind.fitness = fitness_value(cfg, kl, ind.removed)
 
             # ---- fair same-batch comparison against the global elite ----
+            # ``elite_winner`` records which explorer (by mutation_frac) became
+            # the new global elite THIS generation, for the per-rate win stats
+            # and the live MUT log line. None when the elite did not change.
+            elite_winner: Optional[Individual] = None
             if global_elite is None:
                 # first generation: crown the best founder as the elite, so
-                # there is a reference to beat from gen 1 on.
+                # there is a reference to beat from gen 1 on. NOT counted as a
+                # rate win: no mutation produced it (assigned-rate rule #6).
                 best_ind = min(population, key=lambda i: i.fitness)
                 global_elite = Individual(
                     genome=clone_genome(best_ind.genome, keep_id=True),
                     fitness=best_ind.fitness, kl=best_ind.kl, removed=best_ind.removed,
+                    mutation_frac=best_ind.mutation_frac,
                 )
                 for ind in population:
                     ind.fail_count = 0
@@ -455,7 +510,16 @@ def ratchet_search(
                     global_elite = Individual(
                         genome=clone_genome(best_beater.genome, keep_id=True),
                         fitness=best_beater.fitness, kl=best_beater.kl, removed=best_beater.removed,
+                        mutation_frac=best_beater.mutation_frac,
                     )
+                    elite_winner = best_beater
+
+            # Mutations that drove the wins: elite_wins are only counted after
+            # generation 0 (a founder is not a mutation-driven win).
+            if elite_winner is not None and gen >= 1:
+                k = round(elite_winner.mutation_frac, 6)
+                if k in rate_stats:
+                    rate_stats[k]["elite_wins"] += 1
 
             # ---- stable objective: validate top-K on the VALIDATION set ----
             # NOTE: the archive decision MUST use ONE authoritative evaluator so
@@ -500,6 +564,13 @@ def ratchet_search(
                     result.best_genome = archived.genome
                     result.best_removed = max(result.best_removed, ind.removed)
                     _save_archive(cfg, layer, archived, archive_dir, variant)
+                    # Assigned-rate win #6: a new best VALIDATION record is the
+                    # strongest evidence a rate works. Skip generation 0 (the
+                    # founder was random, not mutation-driven).
+                    if gen >= 1:
+                        k = round(ind.mutation_frac, 6)
+                        if k in rate_stats:
+                            rate_stats[k]["archive_wins"] += 1
 
             best = global_elite if global_elite is not None else min(population, key=lambda i: i.fitness)
             av = archive.get(target)
@@ -537,6 +608,8 @@ def ratchet_search(
                     prev_arch_kl=_prev, pop_size=len(population),
                     debug_every=getattr(cfg.search, "diversity_debug_every", 10),
                     gen_time=(time.time() - t_gen),
+                    mut={"winner": elite_winner.mutation_frac if elite_winner is not None else None,
+                         "rate_stats": rate_stats},
                 )
                 _last_arch[target] = av.validated_kl if av else float("nan")
             except Exception:
@@ -557,7 +630,8 @@ def ratchet_search(
             # then mutate/re-base everybody.
             snapshot = [
                 Individual(genome=ind.genome, fitness=ind.fitness, kl=ind.kl,
-                           removed=ind.removed, fail_count=ind.fail_count)
+                           removed=ind.removed, fail_count=ind.fail_count,
+                           mutation_frac=ind.mutation_frac)
                 for ind in population
             ]
             rebase_base_of: dict[int, Individual] = {}
@@ -566,20 +640,28 @@ def ratchet_search(
                     rebase_base_of[i] = tournament_parent(snapshot, tsize, rng)
 
             for i, ind in enumerate(population):
+                # The explorer's OWN assigned rate stays put: re-basing copies a
+                # donor genome but the slot keeps its rate (donor rate NOT copied).
+                frac = ind.mutation_frac
                 if i in rebase_base_of:
                     # a stuck explorer: copy the frozen-snapshot-selected base
                     # and mutate it to start a fresh search path.
                     base = rebase_base_of[i]
                     ind.genome = rebase_explorer(
-                        cfg, base.genome, width, target, rng, fixed_pruned)
+                        cfg, base.genome, width, target, rng, fixed_pruned,
+                        mutation_frac=frac)
                     if not use_rotations:
                         ind.genome.rotations = []
                     ind.fail_count = 0
                     ind.kl = float("inf")
                     ind.fitness = float("inf")
+                    k = round(frac, 6)
+                    if k in rate_stats:
+                        rate_stats[k]["rebases"] += 1
                 else:
                     ind.genome = mutate_from_self(
-                        cfg, ind.genome, width, target, rng, fixed_pruned)
+                        cfg, ind.genome, width, target, rng, fixed_pruned,
+                        mutation_frac=frac)
                     if not use_rotations:
                         ind.genome.rotations = []
                     ind.kl = float("inf")
@@ -605,7 +687,42 @@ def ratchet_search(
             break  # fail to meet constraint at this level -> stop
 
     result.points = [archive[k] for k in sorted(archive)]
+    result.rate_stats = {round(k, 6): dict(v) for k, v in rate_stats.items()}
+    _emit_mutation_rate_table(variant, result.rate_stats)
     return result
+
+
+def _emit_mutation_rate_table(variant: str, rate_stats: dict) -> None:
+    """Print the end-of-run mutation-rate results table for one variant.
+
+        mutation rate results (GA+rot)
+         rate   elite wins   archive wins   rebases
+          1%       0             0            3
+          2%       1             0            2
+           ...
+         17%       6             3            1
+           ...
+         32%       1             0            4
+
+    Best-effort; never raises. The same data is also written to
+    ``run_results.json`` via ``SearchResult.rate_stats``.
+    """
+    try:
+        if not rate_stats:
+            return
+        _emit_line("")
+        _emit_line(f"{_c('mutation rate results', 'bold')} ({_c(_variant_tag(variant), 'cyan')}):")
+        _emit_line(f"  {_c('rate', 'bold'):>5}  {_c('elite wins', 'bold'):>11}  "
+                   f"{_c('archive wins', 'bold'):>12}  {_c('rebases', 'bold'):>8}")
+        for k in sorted(rate_stats):
+            st = rate_stats[k]
+            _emit_line(
+                f"  {int(round(k*100)):>3}%  {st.get('elite_wins', 0):>11}  "
+                f"{st.get('archive_wins', 0):>12}  {st.get('rebases', 0):>8}"
+            )
+        _emit_line("")
+    except Exception:
+        pass
 
 
 def _save_archive(cfg: Config, layer: int, point: ParetoPoint,

@@ -80,6 +80,25 @@ class Individual:
     removed: int = 0                # channels removed (for objective bookkeeping)
     validated_kl: float = float("nan")  # holdout-validated KL
     fail_count: int = 0             # consecutive gens without beating the global elite
+    # Per-explorer ASSIGNED mutation rate (fraction of rotation angles changed
+    # each generation). Belongs to the SLOT, not the genome: it is assigned once
+    # at population creation (ascending across candidates) and is preserved
+    # across re-basing — a 20% explorer re-based onto a 5% explorer's genome
+    # stays a 20% explorer. 0.0 = unassigned (unit-test / no-rotation paths).
+    mutation_frac: float = 0.0
+
+
+def assigned_mutation_fracs(population_size: int, rate_max: float) -> list[float]:
+    """Ascending, fixed per-slot mutation rates for a population.
+
+    candidate i (0-based) -> (i + 1) / population_size * rate_max. With the
+    defaults (population 32, rate_max 0.32) this yields 1%, 2%, ..., 32% — a
+    spread from cautious to aggressive. The list is returned in slot order so
+    slot i keeps its rate for the WHOLE run (even across re-basing).
+    """
+    if population_size <= 0:
+        return []
+    return [(i + 1) / population_size * rate_max for i in range(population_size)]
 
 
 class GARandom:
@@ -307,14 +326,19 @@ def repair_rotations_after_mask(cfg: Config, genome: Genome, width: int,
 
 def _mutate_angles_guaranteed(cfg: Config, genome: Genome, rng: random.Random,
                               frac: Optional[float] = None) -> None:
-    """Mutate ~``frac`` (default cfg.ga.angle_mutate_frac, 5%) of rotation angles.
+    """Mutate ~``frac`` of rotation angles.
+
+    With a ``frac`` given (a per-explorer assigned mutation rate), that fraction
+    is used; otherwise it falls back to ``cfg.ga.angle_mutate_frac`` (the fixed
+    5% default, used by unit tests / legacy callers).
 
     This is the GUARANTEED mutation: with independent-explorer mode, mutation
-    happens 100% of the time (reviewer fix #3). Each selected angle gets the
-    small Gaussian change (``angle_mutate_std``), with an occasional large jump
-    (``large_angle_p`` / ``large_angle_std``) for exploration. Mutating only one
-    angle per generation on ~440-1000 rotations is nearly a no-op, so we always
-    touch a meaningful fraction.
+    happens 100% of the time (reviewer fix #3 / assigned-rate experiment). Each
+    selected angle gets the small Gaussian change (``angle_mutate_std``), with
+    an occasional large jump (``large_angle_p`` / ``large_angle_std``) for
+    exploration. Mutating only one angle per generation on ~440-1000 rotations
+    is nearly a no-op, so the per-explorer rate determines how many angles we
+    actually touch: 1% -> ~4 on a 440 genome, 20% -> ~88, 32% -> ~141.
     """
     n = len(genome.rotations)
     if n == 0:
@@ -332,15 +356,21 @@ def _mutate_angles_guaranteed(cfg: Config, genome: Genome, rng: random.Random,
 
 def _mutate_explorer_core(cfg: Config, genome: Genome, width: int, target: int,
                           rng: random.Random,
-                          fixed_pruned: Optional[set] = None) -> Genome:
+                          fixed_pruned: Optional[set] = None,
+                          mutation_frac: Optional[float] = None) -> Genome:
     """Independent-explorer mutation engine (reviewer fixes #3 and #4).
 
     Order (fix #4 — mask FIRST, then repair, then angles/endpoints/add/remove):
         1. copy the parent genome
         2. mutate the pruned mask (probabilistic swap)
         3. REPAIR rotations against the new mask (fix lost cross-boundary intent)
-        4. mutate angles (GUARANTEED, ~5% every generation), then the
-           probabilistic endpoint / add / remove operators on top.
+        4. mutate angles (GUARANTEED, ~``mutation_frac`` every generation), then
+           the probabilistic endpoint / add / remove operators on top.
+
+    ``mutation_frac`` is the assigned per-explorer rate controlling how many
+    angles get mutated (fallback: ``cfg.ga.angle_mutate_frac``). It is a
+    property of the EXPLORER SLOT and stays with the caller regardless of which
+    genome is being copied.
 
     In rotation-isolation mode (``fixed_pruned``), the mask is frozen and only
     rotations evolve (mask mutation is skipped entirely).
@@ -354,8 +384,8 @@ def _mutate_explorer_core(cfg: Config, genome: Genome, width: int, target: int,
         g.with_target_pruned(target, rng, width)   # keep exactly `target` removed
     # repair rotations against any mask change, BEFORE touching angles.
     repair_rotations_after_mask(cfg, g, width, changed, rng)
-    # guaranteed angle mutation (100% of the time).
-    _mutate_angles_guaranteed(cfg, g, rng)
+    # guaranteed angle mutation (100% of the time) at the explorer's rate.
+    _mutate_angles_guaranteed(cfg, g, rng, frac=mutation_frac)
     # probabilistic extra mutations on top.
     if g.rotations and rng.random() < cfg.ga.replace_a_p:
         i = rng.randrange(len(g.rotations))
@@ -379,22 +409,28 @@ def _mutate_explorer_core(cfg: Config, genome: Genome, width: int, target: int,
 
 
 def mutate_from_self(cfg: Config, genome: Genome, width: int, target: int,
-                     rng: random.Random, fixed_pruned: Optional[set] = None) -> Genome:
+                     rng: random.Random, fixed_pruned: Optional[set] = None,
+                     mutation_frac: Optional[float] = None) -> Genome:
     """Independent-explorer evolution: a candidate mutates ONLY from itself.
 
     No crossover, no other parent. The child inherits both the rotations and
     the pruned mask of its sole self-parent, then the FULL explorer mutation
-    (mask-first + repair + guaranteed ~5% angle mutation + probabilistic
-    endpoint/add/remove) applies. Returns the new genome with a fresh identity
-    whose single parent is ``genome``.
+    (mask-first + repair + guaranteed angle mutation at the explorer's own rate
+    + probabilistic endpoint/add/remove) applies. Returns the new genome with a
+    fresh identity whose single parent is ``genome``.
+
+    ``mutation_frac`` is the assigned per-explorer mutation rate (defaults to
+    ``cfg.ga.angle_mutate_frac`` when not supplied).
     """
-    g = _mutate_explorer_core(cfg, genome, width, target, rng, fixed_pruned)
+    g = _mutate_explorer_core(cfg, genome, width, target, rng, fixed_pruned,
+                              mutation_frac=mutation_frac)
     g.parent_ids = [genome.id] if genome.id is not None else []
     return g
 
 
 def rebase_explorer(cfg: Config, base: Genome, width: int, target: int,
-                    rng: random.Random, fixed_pruned: Optional[set] = None) -> Genome:
+                    rng: random.Random, fixed_pruned: Optional[set] = None,
+                    mutation_frac: Optional[float] = None) -> Genome:
     """Rebase a stuck explorer onto a tournament-selected base and mutate it.
 
     The fresh genome copies ``base`` then runs the SAME guaranteed explorer
@@ -402,8 +438,13 @@ def rebase_explorer(cfg: Config, base: Genome, width: int, target: int,
     rescued candidate a new path. Used only when a candidate has failed
     ``cfg.ga.fail_limit`` consecutive generations without beating the global
     elite.
+
+    ``mutation_frac`` is the ASSIGNED rate of the SLOT being rescued (NOT the
+    base's): the tournament donor's rate is deliberately not copied, so a 20%
+    explorer re-based onto a 5% explorer's genome stays a 20% explorer.
     """
-    g = _mutate_explorer_core(cfg, base, width, target, rng, fixed_pruned)
+    g = _mutate_explorer_core(cfg, base, width, target, rng, fixed_pruned,
+                              mutation_frac=mutation_frac)
     g.parent_ids = [base.id] if base.id is not None else []
     return g
 

@@ -103,9 +103,19 @@ class GaConfig:
     add_rotation_p: float = 0.15
     remove_rotation_p: float = 0.10
     # Independent-explorer mode: the fraction of rotation angles mutated EVERY
-    # generation (guaranteed, 100% of the time). Default 5% -> ~22 angle changes
-    # on a 440-rotation genome, ~50 on a 1000-rotation genome.
+    # generation (guaranteed, 100% of the time). Used as the fallback when no
+    # per-explorer mutation_frac is supplied (e.g. unit tests calling
+    # mutate_from_self directly). Active search overrides this with the
+    # per-explorer assigned rate (1%..32%).
     angle_mutate_frac: float = 0.05
+    # Per-explorer assigned mutation rate. Each candidate slot gets a FIXED,
+    # ascending rate that does NOT change over the run:
+    #   candidate i -> (i + 1) / population * mutation_rate_max
+    # With population=32 and rate_max=0.32 this gives 1%, 2%, ..., 32% — a
+    # spread from cautious to aggressive. The rate controls how many rotation
+    # angles that explorer mutates per generation, and it survives re-basing
+    # (the rate belongs to the slot, not the genome it copies).
+    mutation_rate_max: float = 0.32
     angle_mutate_p: float = 0.5         # legacy-only (single-angle gate for `mutate`)
     angle_mutate_std: float = 0.15      # small Gaussian angle mutations
     large_angle_p: float = 0.05         # occasional large angle mutation

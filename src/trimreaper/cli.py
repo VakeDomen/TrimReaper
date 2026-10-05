@@ -244,6 +244,12 @@ def _write_run_report(run_dir, cfg, res_rot, res_norot, baselines) -> str:
         "config": _config_to_dict(cfg),
         "ga_rotations": [_pt(p) for p in res_rot.points],
         "ga_no_rotations": [_pt(p) for p in res_norot.points],
+        # Per-assigned-mutation-rate win statistics per variant (which explorer
+        # rates produced elite/archive wins or got re-based).
+        "rate_stats": {
+            "rotations": getattr(res_rot, "rate_stats", {}),
+            "no_rotations": getattr(res_norot, "rate_stats", {}),
+        },
         "baselines": {
             name: {vname: [list(pt) for pt in pts] for vname, pts in sets.items()}
             for name, sets in baselines.items()

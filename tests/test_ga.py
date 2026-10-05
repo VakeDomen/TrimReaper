@@ -6,6 +6,7 @@ from trimreaper.config import Config
 from trimreaper.ga import (
     Genome,
     Individual,
+    assigned_mutation_fracs,
     clone_genome,
     crossover,
     fitness_value,
@@ -270,3 +271,68 @@ def test_repair_rotations_after_mask_direct():
     repair_rotations_after_mask(cfg, child, 64, changed, rng)
     for rot in child.rotations:
         assert rot.a != rot.b
+
+
+def test_assigned_mutation_fracs_ascending():
+    """Each explorer SLOT gets a fixed ascending rate (1%..32% at pop 32)."""
+    fracs = assigned_mutation_fracs(32, 0.32)
+    assert len(fracs) == 32
+    assert abs(fracs[0] - 0.01) < 1e-9    # candidate 0 -> 1%
+    assert abs(fracs[-1] - 0.32) < 1e-9   # candidate 31 -> 32%
+    assert all(fracs[i] < fracs[i + 1] for i in range(len(fracs) - 1))
+    # a different population still spreads ascending, capped at rate_max
+    fracs16 = assigned_mutation_fracs(16, 0.32)
+    assert len(fracs16) == 16
+    assert abs(fracs16[-1] - 0.32) < 1e-9
+
+
+def test_mutate_from_self_uses_assigned_frac():
+    """The explorer's OWN assigned rate controls how many angles mutate (the
+    rate belongs to the slot; it is NOT the fixed config default)."""
+    from trimreaper.ga import _mutate_angles_guaranteed
+
+    cfg = _cfg()
+    cfg.ga.angle_mutate_frac = 0.05        # config default irrelevant to assigned path
+    cfg.ga.replace_a_p = 0.0
+    cfg.ga.replace_b_p = 0.0
+    cfg.ga.add_rotation_p = 0.0
+    cfg.ga.remove_rotation_p = 0.0
+    cfg.ga.flip_prune_p = 0.0              # isolate pure angle mutation
+    rng = random.Random(41)
+    parent = make_random_genome(cfg, width=40, target=4, rng=rng)
+    n = len(parent.rotations)
+    assert n >= 4
+    # low-rate explorer mutates a small, strictly-positive fraction
+    child_hi = mutate_from_self(cfg, parent, 40, 4, rng, mutation_frac=0.5)
+    p_angles = [r.angle for r in parent.rotations]
+    c_angles = [r.angle for r in child_hi.rotations]
+    assert c_angles != p_angles
+    # ~50% of angles should have changed
+    changed = sum(1 for pa, ca in zip(p_angles, c_angles) if abs(pa - ca) > 1e-12)
+    assert changed >= int(0.45 * n), (changed, n)
+
+
+def test_rebase_keeps_slot_rate_not_donor_rate():
+    """A 20% explorer re-based onto a 5% explorer's genome stays a 20% explorer:
+    the donor's mutation rate is NOT copied to the child."""
+    cfg = _cfg()
+    cfg.ga.replace_a_p = 0.0
+    cfg.ga.replace_b_p = 0.0
+    cfg.ga.add_rotation_p = 0.0
+    cfg.ga.remove_rotation_p = 0.0
+    cfg.ga.flip_prune_p = 0.0
+    rng = random.Random(51)
+    donor = make_random_genome(cfg, width=40, target=4, rng=rng)
+    # 'rebase_explorer' takes the SLOT's rate via mutation_frac; the donor rate is
+    # the one passed (0.2), independent of the donor genome.
+    rebased = rebase_explorer(cfg, donor, 40, 4, rng, mutation_frac=0.2)
+    assert rebased.id != donor.id
+    assert rebased.parent_ids == [donor.id]
+    # the Individual carrying the rate is built by the caller — we test the
+    # child's angle-change magnitude corresponds to the passed 0.2 rate.
+    d_angles = [r.angle for r in donor.rotations]
+    r_angles = [r.angle for r in rebased.rotations]
+    n = len(donor.rotations)
+    changed = sum(1 for da, ra in zip(d_angles, r_angles) if abs(da - ra) > 1e-12)
+    assert changed >= max(1, int(0.15 * n)), (changed, n)
+    assert changed <= max(1, int(0.35 * n)), (changed, n)

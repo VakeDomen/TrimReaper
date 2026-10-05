@@ -26,12 +26,27 @@ from .rotation import PairRotation, rotation_distance
 # Hazard guard for pathological angle gaps.
 
 
+_GENOME_ID = 0
+
+
+def _next_genome_id() -> int:
+    global _GENOME_ID
+    _GENOME_ID += 1
+    return _GENOME_ID
+
+
 @dataclass
 class Genome:
     """A candidate sparse-rotation + prune genome for one layer."""
 
     rotations: list[PairRotation] = field(default_factory=list)
     pruned: set[int] = field(default_factory=set)
+
+    # lineage tracking (diversity instrumentation): a stable id per genome and
+    # the ids of the two genomes it was bred from. Empty parent_ids for a
+    # freshly-random-initialized genome.
+    id: int = None  # type: ignore[assignment]
+    parent_ids: list[int] = field(default_factory=list)
 
     # ---- construction helpers ------------------------------------------
     def with_target_pruned(self, target: int, rng: random.Random, width: int) -> "Genome":
@@ -110,13 +125,18 @@ def rotation_budget(cfg: Config, target: int) -> int:
     return max(cfg.genome.min_rotations, min(cfg.genome.max_rotations, budget))
 
 
-def make_random_genome(cfg: Config, width: int, target: int, rng: random.Random) -> Genome:
-    g = Genome()
+def make_random_genome(cfg: Config, width: int, target: int, rng: random.Random,
+                       fixed_pruned: Optional[set] = None) -> Genome:
+    g = Genome(id=_next_genome_id())
     # Choose the pruning mask FIRST so delete<->survive-biased rotation pairs
     # can actually pick from known deleted + surviving channels (fix: the old
     # code generated rotations before pruned, so the 70% bias never fired).
-    target = min(target, width)
-    g.pruned = set(rng.sample(range(width), target))
+    if fixed_pruned is not None:
+        # rotation-isolation mode: the mask is frozen; only rotations vary.
+        g.pruned = set(fixed_pruned)
+    else:
+        target = min(target, width)
+        g.pruned = set(rng.sample(range(width), target))
 
     n_rot_max = rotation_budget(cfg, target)
     if target > 0:
@@ -129,7 +149,8 @@ def make_random_genome(cfg: Config, width: int, target: int, rng: random.Random)
     return g
 
 
-def mutate(cfg: Config, genome: Genome, width: int, target: int, rng: random.Random) -> Genome:
+def mutate(cfg: Config, genome: Genome, width: int, target: int, rng: random.Random,
+           fixed_pruned: Optional[set] = None) -> Genome:
     """Return a new Genome produced by random mutations (section 7)."""
     g = Genome(rotations=list(genome.rotations), pruned=set(genome.pruned))
 
@@ -165,12 +186,22 @@ def mutate(cfg: Config, genome: Genome, width: int, target: int, rng: random.Ran
     if len(g.rotations) > 0 and rng.random() < cfg.ga.remove_rotation_p:
         del g.rotations[rng.randrange(len(g.rotations))]
 
+    if fixed_pruned is not None:
+        g.pruned = set(fixed_pruned)   # rotations evolve; mask stays frozen
     return g
 
 
-def mutate_mask(cfg: Config, genome: Genome, width: int, rng: random.Random) -> Genome:
-    """Mutate the pruned-channel mask (section 7 mask mutations)."""
+def mutate_mask(cfg: Config, genome: Genome, width: int, rng: random.Random,
+                fixed_pruned: Optional[set] = None) -> Genome:
+    """Mutate the pruned-channel mask (section 7 mask mutations).
+
+    In rotation-isolation mode (``fixed_pruned`` given), the mask is frozen and
+    this is a no-op (the genome keeps the fixed mask unchanged).
+    """
     g = Genome(rotations=list(genome.rotations), pruned=set(genome.pruned))
+    if fixed_pruned is not None:
+        g.pruned = set(fixed_pruned)
+        return g
     if rng.random() < cfg.ga.flip_prune_p and g.pruned:
         # swap one pruned for one surviving
         drop = rng.choice(list(g.pruned))
@@ -182,7 +213,8 @@ def mutate_mask(cfg: Config, genome: Genome, width: int, rng: random.Random) -> 
     return g
 
 
-def crossover(cfg: Config, pa: Genome, pb: Genome, width: int, target: int, rng: random.Random) -> Genome:
+def crossover(cfg: Config, pa: Genome, pb: Genome, width: int, target: int, rng: random.Random,
+              fixed_pruned: Optional[set] = None) -> Genome:
     """Splice/subsample the two parents' rotations; combine + repair masks.
 
     Returns a child Genome with exactly ``target`` pruned channels.
@@ -191,6 +223,9 @@ def crossover(cfg: Config, pa: Genome, pb: Genome, width: int, target: int, rng:
     INTERSECTION, then fill the remainder from their SYMMETRIC DIFFERENCE at
     random until ``target`` is reached. This preserves shared good channels and
     samples disagreement, rather than an arbitrary ``order[:target]`` of a set.
+
+    In rotation-isolation mode (``fixed_pruned`` given), only rotations are
+    crossed over; the child's mask is simply the fixed mask.
     """
     child = Genome()
     na = len(pa.rotations)
@@ -204,6 +239,10 @@ def crossover(cfg: Config, pa: Genome, pb: Genome, width: int, target: int, rng:
     if len(child.rotations) > budget:
         child.rotations = rng.sample(child.rotations, budget)
 
+    if fixed_pruned is not None:
+        child.pruned = set(fixed_pruned)
+        return child
+
     # controlled mask crossover
     target = min(target, width)
     inter = set(pa.pruned) & set(pb.pruned)
@@ -214,6 +253,26 @@ def crossover(cfg: Config, pa: Genome, pb: Genome, width: int, target: int, rng:
         c = remaining.pop(rng.randrange(len(remaining)))
         child.pruned.add(c)
     return child
+
+
+def coverage_stats(genome: Genome, width: int | None = None) -> dict:
+    """Rotation-coverage metrics for an archived genome.
+
+    Used by the rotation-isolation experiment to check whether the chosen
+    rotations actually touch the removed channels: if ``unique_pruned_touched``
+    is far below ``n_rot``/``unique_channels_touched``, much of the rotational
+    freedom is being wasted outside the deleted subspace.
+    """
+    touched = set()
+    for r in genome.rotations:
+        touched.add(r.a)
+        touched.add(r.b)
+    pruned = set(genome.pruned)
+    return {
+        "n_rot": len(genome.rotations),
+        "unique_channels_touched": len(touched),
+        "unique_pruned_touched": len(touched & pruned),
+    }
 
 
 def fitness_value(cfg: Config, kl: float, removed: int) -> float:
@@ -252,34 +311,46 @@ def selection(pop: list[Individual], elitism: int, tournament_size: int = 4, rng
 
 
 def make_child_population(
-    cfg: Config, parents: list[Individual], width: int, target: int, rng: random.Random
+    cfg: Config, parents: list[Individual], width: int, target: int, rng: random.Random,
+    fixed_pruned: Optional[set] = None,
 ) -> list[Genome]:
     """Produce the next generation's genomes from the surviving parents.
 
     Each non-elite child is bred from TWO tournament-selected parents (chosen
     independently from the FULL previous population, best-of-k), so good
     individuals reproduce more — real selection pressure, not uniform random.
+
+    When ``fixed_pruned`` is given (rotation-isolation mode), the mask is
+    frozen and only rotations evolve.
     """
     next_gen: list[Genome] = []
     elites = sorted(parents, key=lambda ind: ind.fitness)[:cfg.ga.elitism]
-    # keep elites verbatim
+    # keep elites verbatim (retain their lineage id so ancestry is traceable)
     for e in elites:
-        next_gen.append(Genome(rotations=list(e.genome.rotations), pruned=set(e.genome.pruned)))
+        el = Genome(rotations=list(e.genome.rotations),
+                    pruned=set(fixed_pruned) if fixed_pruned is not None else set(e.genome.pruned),
+                    id=e.genome.id, parent_ids=list(e.genome.parent_ids))
+        next_gen.append(el)
 
     tsize = getattr(cfg.ga, "tournament_size", 4)
     while len(next_gen) < cfg.ga.population:
         if len(parents) < 2:
-            next_gen.append(make_random_genome(cfg, width, target, rng))
+            child = make_random_genome(cfg, width, target, rng, fixed_pruned)
+            next_gen.append(child)
             continue
         a = tournament_parent(parents, tsize, rng)
         b = tournament_parent(parents, tsize, rng)
         if rng.random() < cfg.ga.mutation_rate:
-            child = mutate(cfg, a.genome if a is b else crossover(cfg, a.genome, b.genome, width, target, rng),
-                           width, target, rng)
-            child = mutate_mask(cfg, child, width, rng)
+            child = mutate(cfg, a.genome if a is b else crossover(cfg, a.genome, b.genome, width, target, rng, fixed_pruned),
+                           width, target, rng, fixed_pruned)
+            child = mutate_mask(cfg, child, width, rng, fixed_pruned)
         else:
-            child = crossover(cfg, a.genome, b.genome, width, target, rng)
-        child.with_target_pruned(target, rng, width)
+            child = crossover(cfg, a.genome, b.genome, width, target, rng, fixed_pruned)
+        if fixed_pruned is None:
+            child.with_target_pruned(target, rng, width)
+        # fresh identity + record the two parents for lineage tracking
+        child.id = _next_genome_id()
+        child.parent_ids = [a.genome.id, b.genome.id]
         next_gen.append(child)
 
     return next_gen

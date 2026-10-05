@@ -9,6 +9,13 @@ Subcommands:
               report metrics.
   sweep-eps   Print guidance + defaults for the epsilon sweep (0.001/0.01/0.05).
 
+Every ``run`` writes all of its outputs to a NEW date-prefixed folder under
+``search.archive_dir`` (e.g. ``runs/archive/20261005_192021_.../<tag>``), so
+consecutive runs never overwrite each other.  Each run folder holds the
+per-variant archive JSONs (rot_*/norot_*), the frontier plot
+(``poa_frontier.png``), and a consolidated machine-readable
+``run_results.json`` report.
+
 All subcommands accept `--key=value` overrides (dotted, e.g. --ga.population=8).
 """
 
@@ -79,6 +86,30 @@ def _load_config(args) -> Config:
     return cfg
 
 
+def _config_to_dict(cfg) -> dict:
+    """Serialize the active config to a plain JSON-safe dict."""
+    from dataclasses import asdict
+
+    d = asdict(cfg)
+    return d
+
+
+def _make_run_dir(cfg, tag: str = "") -> str:
+    """Create and return a date-prefixed run directory so consecutive runs
+    never overwrite each other.
+
+    Layout: ``<archive_dir>/<YYYYMMDD_HHMMSS_micro>[_tag]/``.  The microsecond
+    component keeps runs started within the same second from colliding.
+    """
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    name = stamp if not tag else f"{stamp}_{tag}"
+    run_dir = os.path.join(cfg.search.archive_dir, name)
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
 def cmd_run(args) -> int:
     import time
 
@@ -87,6 +118,8 @@ def cmd_run(args) -> int:
         print(f"[run] {msg}", flush=True)
 
     cfg = _load_config(args)
+    run_dir = _make_run_dir(cfg, getattr(args, "tag", "") or "")
+    log(f"run outputs -> {run_dir}")
     t0_all = time.time()
     log(f"model_id={cfg.model.model_id} device={cfg.resolve_device()} layers={cfg.model.layers}")
     log(f"settings: rounds={cfg.search.rounds} target={cfg.search.start_target}->{cfg.search.max_target or 'width'}"
@@ -112,8 +145,9 @@ def cmd_run(args) -> int:
     log(f"data ready in {time.time()-t0:.1f}s ({len(val_batches)} val + {len(test_batches)} test batches)")
 
     def _progress(tag: str, eps: float):
-        def cb(target, gen, best_kl, removed):
-            print(f"[{tag}] target={target:5d} gen={gen:3d} best_kl={best_kl:.5f} removed={removed}  (eps={eps})", flush=True)
+        def cb(target, gen, best_kl, removed, arch_kl=float("nan")):
+            a = f" arch_kl={arch_kl:.5f}" if arch_kl == arch_kl else ""
+            print(f"[{tag}] target={target:5d} gen={gen:3d} best_kl={best_kl:.5f} removed={removed}  (eps={eps}){a}", flush=True)
         return cb
 
     log(f"phase 1/3: GA-with-rotations on layer {layer}...")
@@ -121,6 +155,7 @@ def cmd_run(args) -> int:
     res_rot = ratchet_search(
         pm, cfg, layer, streamer, val_batches, use_rotations=True,
         progress=_progress("GA+rot", cfg.search.epsilon),
+        archive_dir=run_dir, variant="rot",
     )
     log(f"GA+rotations done in {time.time()-t0:.1f}s — {res_rot.n_generations} generations total")
 
@@ -129,6 +164,7 @@ def cmd_run(args) -> int:
     res_norot = ratchet_search(
         pm, cfg, layer, streamer, val_batches, use_rotations=False,
         progress=_progress("GA-norot", cfg.search.epsilon),
+        archive_dir=run_dir, variant="norot",
     )
     log(f"GA-no-rotations done in {time.time()-t0:.1f}s — {res_norot.n_generations} generations total")
 
@@ -150,11 +186,14 @@ def cmd_run(args) -> int:
     log("phase 3/3: computing one-shot baselines + plotting frontier...")
     from .sweep import baseline_curves
 
+    baseline_widths = [cfg.search.start_target, cfg.search.start_target + cfg.search.ratchet_step]
     baselines = baseline_curves(
         pm, cfg, layer, streamer,
-        widths=[cfg.search.start_target, cfg.search.start_target + cfg.search.ratchet_step],
+        widths=baseline_widths,
+        val_batches=val_batches,
+        test_batches=test_batches,
     )
-    out = os.path.join(cfg.search.archive_dir, "poa_frontier.png")
+    out = os.path.join(run_dir, "poa_frontier.png")
     plot_frontiers(ga_points, baselines, out)
 
     log(f"frontier plot written to {out}")
@@ -164,12 +203,50 @@ def cmd_run(args) -> int:
     print("=== GA-no-rotations archive ===")
     for p in res_norot.points:
         print(f"  removed={p.removed:5d}  kl={p.kl:.5f}  val_kl={p.validated_kl:.5f}  test_kl={p.test_kl:.5f}")
-    for name, pts in baselines.items():
-        print(f"=== baseline {name} ===")
-        for w, kl in pts:
-            print(f"  removed={w:5d}  kl={kl:.5f}")
-    print(f"\n[run] DONE in {time.time()-t0_all:.1f}s. archive_dir={cfg.search.archive_dir}")
+    print("=== one-shot baselines (SAME validation set as GA) ===")
+    for name, sets in baselines.items():
+        for vname, pts in sets.items():
+            if pts:
+                line = ", ".join(f"{w}->{kl:.5f}" for w, kl in pts)
+                print(f"  {name} [{vname}] {line}")
+
+    # ---- persist a full machine-readable run report alongside the plot ----
+    report_path = _write_run_report(run_dir, cfg, res_rot, res_norot, baselines)
+    log(f"run results saved to {report_path}")
+    print(f"\n[run] DONE in {time.time()-t0_all:.1f}s. run_dir={run_dir}")
     return 0
+
+
+def _write_run_report(run_dir, cfg, res_rot, res_norot, baselines) -> str:
+    """Serialize the full run results (both GA archives + baselines + config)
+    to ``run_dir/run_results.json`` and return the path."""
+    import time as _time
+
+    def _pt(p):
+        return {
+            "removed": p.removed,
+            "kl": p.kl,
+            "validated_kl": p.validated_kl,
+            "test_kl": p.test_kl,
+            "rotations": [r.to_tuple() for r in p.genome.rotations],
+            "pruned": sorted(p.genome.pruned),
+        }
+
+    report = {
+        "run_dir": run_dir,
+        "created": _time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config": _config_to_dict(cfg),
+        "ga_rotations": [_pt(p) for p in res_rot.points],
+        "ga_no_rotations": [_pt(p) for p in res_norot.points],
+        "baselines": {
+            name: {vname: [list(pt) for pt in pts] for vname, pts in sets.items()}
+            for name, sets in baselines.items()
+        },
+    }
+    report_path = os.path.join(run_dir, "run_results.json")
+    with open(report_path, "w") as fh:
+        json.dump(report, fh, indent=2)
+    return report_path
 
 
 def cmd_baselines(args) -> int:
@@ -180,9 +257,13 @@ def cmd_baselines(args) -> int:
     pm = load_pruned_model(cfg)
     layer = cfg.model.layers[0]
     streamer = WikiTextStreamer(cfg)
-    curves = baseline_curves(pm, cfg, layer, streamer)
-    for name, pts in curves.items():
-        print(name, pts)
+    val_batches = streamer.holdout_batches()
+    test_batches = streamer.test_batches()
+    curves = baseline_curves(pm, cfg, layer, streamer,
+                             val_batches=val_batches, test_batches=test_batches)
+    for name, sets in curves.items():
+        for vname, pts in sets.items():
+            print(name, vname, pts)
     return 0
 
 
@@ -233,6 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("run", help="run the proof-of-concept")
     r.add_argument("--layers", default=None, help="comma-separated layer indices")
+    r.add_argument("--tag", default="", help="optional suffix for the dated run folder")
     _add_override_args(r)
     r.set_defaults(func=cmd_run)
 

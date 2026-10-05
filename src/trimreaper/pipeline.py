@@ -3,15 +3,15 @@
 Core routine:
   - At each generation draw ONE random fitness batch; compute baseline logits
     from the pristine model once; evaluate every candidate against it on that
-    same batch (fair comparisons).
+    same batch.
+  - Take the top-K candidates by fitness and validate them on the fixed
+    VALIDATION set (streamed, memory-safe). Archive decisions use VALIDATION
+    KL ONLY -- never the single random fitness batch, whose KL is not
+    comparable across generations.
   - Run G generations for the current deletion target.
-  - When a candidate satisfies KL <= epsilon, validate on the fixed holdout;
-    if it's a new record (or improves an existing one) accept and store it.
-  - On success, ratchet the deletion target upward (32 -> 64 -> 96 ...).
+  - On success (a validated candidate within epsilon) ratchet the deletion
+    target upward (32 -> 64 -> 96 ...).
   - Maintains an anytime archive: best validated removal level found so far.
-
-Returns per-removal-level Pareto points: (channels_removed, kl) and the best
-archive genomes.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from .data import WikiTextStreamer
 from .evaluate import (
     baseline_logits,
     evaluate_candidate,
-    evaluate_candidate_holdout,
+    evaluate_genome_on_set,
 )
 from .ga import (
     GARandom,
@@ -68,18 +68,26 @@ def ratchet_search(
     cfg: Config,
     layer: int,
     streamer: WikiTextStreamer,
-    holdout_batches: list[torch.Tensor],
+    val_batches: list[torch.Tensor],
     use_rotations: bool = True,
     progress=None,
+    archive_dir: Optional[str] = None,
+    variant: str = "",
 ) -> SearchResult:
     """Run the ratcheting GA for one layer with a given method.
 
     ``use_rotations=False`` implements the "GA selecting channels WITHOUT
     rotations" baseline (PLAN.md section 13): genomes carry only the mask.
+
+    ``archive_dir`` overrides where per-record JSON archives are written
+    (default: ``cfg.search.archive_dir``). ``variant`` is a short label
+    (e.g. "rot" / "norot") embedded in the archive filenames so the two GA
+    runs in a single ``run`` do not overwrite each other's records.
     """
     width = _intermediate_size(pm, layer)
     seq_len = cfg.data.seq_len
     fit_batch = cfg.data.fit_batch
+    valid_best_k = max(1, cfg.search.valid_best_k)
 
     rng_wrap = GARandom(cfg)
     rng = rng_wrap.python
@@ -93,10 +101,6 @@ def ratchet_search(
     max_target = min(max_target, width)
 
     while target <= max_target:
-        # generations to run per ratchet target.
-        # cfg.search.rounds > 0 -> bounded. If 0 (anytime) we still need a
-        # finite per-target cap; use a large default (callers can set a real
-        # budget via search.rounds on the CLI).
         gen_limit = cfg.search.rounds if cfg.search.rounds > 0 else 10_000_000
         # --- build initial population for this target ---
         population: list[Individual] = []
@@ -105,8 +109,6 @@ def ratchet_search(
             if not use_rotations:
                 g.rotations = []
             population.append(Individual(genome=g))
-
-        best_kl = float("inf")
 
         for gen in range(gen_limit):
             # NEW random batch every generation, same for all candidates.
@@ -123,52 +125,49 @@ def ratchet_search(
                 ind.removed = len(ind.genome.pruned)
                 ind.fitness = fitness_value(cfg, kl, ind.removed)
 
-            best = min(population, key=lambda i: i.fitness)
-            best_kl = best.kl
-            if progress:
-                progress(target, gen, best.kl, best.removed)
-
-            # Success driving the ratchet: a candidate is archived (below) whose
-            # holdout-validated KL is within epsilon for this target.
-
-            # holdout validate whenever the best candidate improves the KL
-            # (prevents lucky fitness evals from being accepted, PLAN 12)
-            cur_best_for_target = archive.get(target)
-            if (cur_best_for_target is None
-                    or best.kl < cur_best_for_target.kl) and best.removed > 0:
-                holdout_kl = evaluate_candidate_holdout(
-                    pm, holdout_batches, layer,
-                    best.genome.rotations if use_rotations else [],
-                    sorted(best.genome.pruned), seq_len,
+            # ---- stable objective: validate top-K on the VALIDATION set ----
+            top = sorted(population, key=lambda i: i.fitness)[:valid_best_k]
+            for ind in top:
+                vkl = evaluate_genome_on_set(
+                    pm, val_batches, layer, ind.genome, seq_len
                 )
-                if (cur_best_for_target is None
-                        or holdout_kl < cur_best_for_target.validated_kl):
+                ind.validated_kl = vkl
+                cur = archive.get(target)
+                if (cur is None or vkl < cur.validated_kl) and ind.removed > 0:
                     archived = ParetoPoint(
-                        removed=best.removed,
-                        kl=best.kl,
-                        validated_kl=holdout_kl,
+                        removed=ind.removed,
+                        kl=ind.kl,
+                        validated_kl=vkl,
                         genome=Genome(
-                            rotations=list(best.genome.rotations),
-                            pruned=set(best.genome.pruned),
+                            rotations=list(ind.genome.rotations),
+                            pruned=set(ind.genome.pruned),
                         ),
                     )
                     archive[target] = archived
                     result.points.append(archived)
                     result.best_genome = archived.genome
-                    result.best_removed = max(result.best_removed, best.removed)
-                    _save_archive(cfg, layer, archived)
+                    result.best_removed = max(result.best_removed, ind.removed)
+                    _save_archive(cfg, layer, archived, archive_dir, variant)
 
-            # produce the next generation
+            best = min(population, key=lambda i: i.fitness)
+            if progress:
+                av = archive.get(target)
+                progress(target, gen, best.kl, best.removed,
+                         arch_kl=av.validated_kl if av else float("nan"))
+
+            # produce the next generation (tournament selection inside)
             population = [
                 Individual(genome=g)
                 for g in make_child_population(cfg, population, width, target, rng)
             ]
+            if not use_rotations:
+                for ind in population:
+                    ind.genome.rotations = []
 
         result.n_generations += gen_limit
-        # whether to advance the ratchet
+        # whether to advance the ratchet (validated record within epsilon)
         prev = archive.get(target)
         if prev is not None and prev.validated_kl <= cfg.search.epsilon:
-            # success -> ratchet up
             target += cfg.search.ratchet_step
         else:
             break  # fail to meet constraint at this level -> stop
@@ -177,13 +176,16 @@ def ratchet_search(
     return result
 
 
-def _save_archive(cfg: Config, layer: int, point: ParetoPoint) -> None:
+def _save_archive(cfg: Config, layer: int, point: ParetoPoint,
+                  archive_dir: Optional[str] = None, variant: str = "") -> None:
     """Persist a new record to the archive dir as JSON."""
     import json
 
     try:
-        os.makedirs(cfg.search.archive_dir, exist_ok=True)
-        path = os.path.join(cfg.search.archive_dir, f"layer{layer}_removed{point.removed}.json")
+        arc_dir = archive_dir or cfg.search.archive_dir
+        os.makedirs(arc_dir, exist_ok=True)
+        prefix = f"{variant}_" if variant else ""
+        path = os.path.join(arc_dir, f"{prefix}layer{layer}_removed{point.removed}.json")
         data = {
             "layer": layer,
             "removed": point.removed,

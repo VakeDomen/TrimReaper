@@ -12,6 +12,7 @@ from trimreaper.ga import (
     mutate,
     mutate_mask,
     rotation_budget,
+    tournament_parent,
 )
 
 
@@ -32,6 +33,52 @@ def test_random_genome_respects_bounds():
     assert len(g.pruned) == 10
     for rot in g.rotations:
         assert 0 <= rot.a < 100 and 0 <= rot.b < 100 and rot.a != rot.b
+
+
+def test_random_genome_mask_before_rotations():
+    """Regression (fix): the pruning mask must exist BEFORE rotations are
+    generated, otherwise delete<->survive-biased pairs have no known deleted
+    channels and the 70% bias never fires on initial genomes."""
+    cfg = _cfg()
+    cfg.genome.delete_survive_bias = 1.0   # force the bias
+    rng = random.Random(0)
+    g = make_random_genome(cfg, width=100, target=10, rng=rng)
+    assert len(g.pruned) == 10
+    # Every rotation must pair a deleted channel with a survivor (bias=1.0).
+    assert g.rotations, "expected at least one rotation"
+    for rot in g.rotations:
+        dead, alive = set(g.pruned), set(range(100)) - set(g.pruned)
+        assert (rot.a in dead and rot.b in alive) or (rot.b in dead and rot.a in alive), \
+            f"rotation ({rot.a},{rot.b}) not delete<->survive biased"
+
+
+def test_tournament_parent_favors_fitness():
+    """Selection pressure: a fitter individual must win tournaments more often
+    than a worse one (best-of-k, chosen independently per parent)."""
+    cfg = _cfg()
+    rng = random.Random(0)
+    pop = [Individual(genome=Genome(), fitness=f) for f in (1.0, 0.0, 10.0)]
+    wins = {id(pop[i]): 0 for i in range(3)}
+    for _ in range(200):
+        p = tournament_parent(pop, tournament_size=3, rng=rng)
+        wins[id(p)] += 1
+    # The best (fitness 0.0) must win (nearly) every time with k=3.
+    assert wins[id(pop[1])] == 200
+
+
+def test_crossover_mask_keeps_intersection_and_target():
+    """Controlled mask crossover: preserves the parental intersection and ends
+    at exactly the target size."""
+    cfg = _cfg()
+    rng = random.Random(4)
+    pa_pruned = {0, 1, 2, 3, 4, 5, 6, 7}
+    pb_pruned = {2, 3, 4, 5, 8, 9, 10, 11}
+    pa = Genome(rotations=[], pruned=set(pa_pruned))
+    pb = Genome(rotations=[], pruned=set(pb_pruned))
+    child = crossover(cfg, pa, pb, width=100, target=6, rng=rng)
+    # Intersection {2,3,4,5} preserved entirely (it's within target).
+    assert {2, 3, 4, 5} <= child.pruned
+    assert len(child.pruned) == 6
 
 
 def test_rotation_budget_scales_with_target():

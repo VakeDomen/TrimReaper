@@ -112,14 +112,20 @@ def rotation_budget(cfg: Config, target: int) -> int:
 
 def make_random_genome(cfg: Config, width: int, target: int, rng: random.Random) -> Genome:
     g = Genome()
+    # Choose the pruning mask FIRST so delete<->survive-biased rotation pairs
+    # can actually pick from known deleted + surviving channels (fix: the old
+    # code generated rotations before pruned, so the 70% bias never fired).
+    target = min(target, width)
+    g.pruned = set(rng.sample(range(width), target))
+
     n_rot_max = rotation_budget(cfg, target)
-    n_rot = rng.randint(cfg.genome.min_rotations, n_rot_max)
+    if target > 0:
+        n_rot = rng.randint(min(cfg.genome.min_rotations, n_rot_max), n_rot_max)
+    else:
+        n_rot = 0
     for _ in range(n_rot):
         a, b = random_rotation_pair(width, g, cfg, rng)
         g.rotations.append(PairRotation(a, b, random_angle(cfg, rng)))
-    # initial pruned set sampled from survivors of nothing (all channels).
-    target = min(target, width)
-    g.pruned = set(rng.sample(range(width), target))
     return g
 
 
@@ -180,6 +186,11 @@ def crossover(cfg: Config, pa: Genome, pb: Genome, width: int, target: int, rng:
     """Splice/subsample the two parents' rotations; combine + repair masks.
 
     Returns a child Genome with exactly ``target`` pruned channels.
+
+    Mask crossover (controlled genetic operation): keep the parental
+    INTERSECTION, then fill the remainder from their SYMMETRIC DIFFERENCE at
+    random until ``target`` is reached. This preserves shared good channels and
+    samples disagreement, rather than an arbitrary ``order[:target]`` of a set.
     """
     child = Genome()
     na = len(pa.rotations)
@@ -193,15 +204,15 @@ def crossover(cfg: Config, pa: Genome, pb: Genome, width: int, target: int, rng:
     if len(child.rotations) > budget:
         child.rotations = rng.sample(child.rotations, budget)
 
-    # combine masks: union, then repair to target
-    union = set(pa.pruned) | set(pb.pruned)
+    # controlled mask crossover
     target = min(target, width)
-    child.pruned = set(list(union)[:target])
-    for _ in range(target - len(child.pruned)):
-        candidates = [c for c in range(width) if c not in child.pruned]
-        if not candidates:
-            break
-        child.pruned.add(rng.choice(candidates))
+    inter = set(pa.pruned) & set(pb.pruned)
+    diff = (set(pa.pruned) ^ set(pb.pruned)) - inter
+    child.pruned = set(list(inter)[:target])   # shared channels first
+    remaining = list(diff) + [c for c in range(width) if c not in (set(pa.pruned) | set(pb.pruned))]
+    while len(child.pruned) < target and remaining:
+        c = remaining.pop(rng.randrange(len(remaining)))
+        child.pruned.add(c)
     return child
 
 
@@ -218,33 +229,50 @@ def fitness_value(cfg: Config, kl: float, removed: int) -> float:
     return kl + penalty
 
 
-def selection(pop: list[Individual], elitism: int) -> list[Individual]:
-    """Tournament-light selection: sort by fitness (lower better), keep top.
+def tournament_parent(
+    pop: list[Individual], tournament_size: int, rng: random.Random
+) -> Individual:
+    """Pick one parent via tournament selection (best of ``tournament_size``)."""
+    k = min(tournament_size, len(pop))
+    contenders = rng.sample(pop, k)
+    return min(contenders, key=lambda ind: ind.fitness)
 
-    Parents are the elites plus random draws weighted toward fitness.
+
+def selection(pop: list[Individual], elitism: int, tournament_size: int = 4, rng=None) -> list[Individual]:
+    """Select surviving parents using REAL tournament selection.
+
+    Returns ``elitism`` elite individuals (best by fitness) plus a pool of
+    tournament-selected parents. Lower fitness is better. The returned list
+    drives the next generation's reproduction.
     """
     pop_sorted = sorted(pop, key=lambda ind: ind.fitness)
     elites = pop_sorted[:elitism]
-    return elites
+    parents = list(elites)
+    return parents
 
 
 def make_child_population(
     cfg: Config, parents: list[Individual], width: int, target: int, rng: random.Random
 ) -> list[Genome]:
-    """Produce the next generation's genomes from the surviving parents."""
+    """Produce the next generation's genomes from the surviving parents.
+
+    Each non-elite child is bred from TWO tournament-selected parents (chosen
+    independently from the FULL previous population, best-of-k), so good
+    individuals reproduce more — real selection pressure, not uniform random.
+    """
     next_gen: list[Genome] = []
-    elites = selection(parents, cfg.ga.elitism)
+    elites = sorted(parents, key=lambda ind: ind.fitness)[:cfg.ga.elitism]
     # keep elites verbatim
     for e in elites:
         next_gen.append(Genome(rotations=list(e.genome.rotations), pruned=set(e.genome.pruned)))
 
+    tsize = getattr(cfg.ga, "tournament_size", 4)
     while len(next_gen) < cfg.ga.population:
         if len(parents) < 2:
-            # no parents yet: random
             next_gen.append(make_random_genome(cfg, width, target, rng))
             continue
-        a = rng.choice(parents)
-        b = rng.choice(parents)
+        a = tournament_parent(parents, tsize, rng)
+        b = tournament_parent(parents, tsize, rng)
         if rng.random() < cfg.ga.mutation_rate:
             child = mutate(cfg, a.genome if a is b else crossover(cfg, a.genome, b.genome, width, target, rng),
                            width, target, rng)

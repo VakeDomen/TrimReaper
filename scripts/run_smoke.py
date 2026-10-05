@@ -46,12 +46,28 @@ class FakeStreamer:
         # small fixed holdout for the demo
         return [self.batch(2, 32) for _ in range(2)]
 
+    def test_batches(self):
+        return [self.batch(2, 32) for _ in range(2)]
+
 
 def main() -> int:
+    from datetime import datetime
+
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", default="runs/smoke", help="output directory")
+    ap.add_argument("--out", default="", help="output directory (default: runs/smoke/<date>_<tag>)")
+    ap.add_argument("--tag", default="", help="optional suffix for the run folder")
     args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
+
+    # Date-prefixed run folder so consecutive smoke runs never overwrite.
+    if args.out:
+        out = args.out
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        out = os.path.join("runs", "smoke", f"{stamp}{('_' + args.tag) if args.tag else ''}")
+    os.makedirs(out, exist_ok=True)
+    archive_dir = os.path.join(out, "archive")
+    os.makedirs(archive_dir, exist_ok=True)
+    print(f"[smoke] run outputs -> {out}")
 
     cfg = Config.defaults()
     cfg.model.layers = [0]
@@ -62,7 +78,7 @@ def main() -> int:
     cfg.search.max_target = 80   # cap so the smoke demo finishes fast on a busy CPU
     cfg.search.rounds = 2
     cfg.search.epsilon = 0.5
-    cfg.search.archive_dir = os.path.join(args.out, "archive")
+    cfg.search.archive_dir = archive_dir
     cfg.genome.min_rotations = 2
     cfg.genome.max_rotations = 8
     cfg.data.seq_len = 32
@@ -76,8 +92,10 @@ def main() -> int:
     print(f"[smoke] MLP width = {width}")
 
     t = time.time()
-    res_rot = ratchet_search(pm, cfg, 0, streamer, holdout, use_rotations=True)
-    res_norot = ratchet_search(pm, cfg, 0, streamer, holdout, use_rotations=False)
+    res_rot = ratchet_search(pm, cfg, 0, streamer, holdout, use_rotations=True,
+                             archive_dir=archive_dir, variant="rot")
+    res_norot = ratchet_search(pm, cfg, 0, streamer, holdout, use_rotations=False,
+                               archive_dir=archive_dir, variant="norot")
     print(f"[smoke] both GA runs took {time.time()-t:.2f}s")
 
     print(f"[smoke] GA+rotations archive:")
@@ -89,13 +107,17 @@ def main() -> int:
         print(f"   removed={p.removed:4d}  kl={p.kl:.5f}  holdout_kl={p.validated_kl:.5f}")
 
     widths = [16, 32]
-    curves = baseline_curves(pm, cfg, 0, streamer, widths=widths)
-    for name, pts in curves.items():
+    val = streamer.holdout_batches()
+    test = streamer.test_batches()
+    curves = baseline_curves(pm, cfg, 0, streamer, widths=widths,
+                             val_batches=val, test_batches=test)
+    for name, sets in curves.items():
+        pts = sets.get("val") or []
         print(f"[smoke] baseline {name}: " + ", ".join(f"{w}->{kl:.4f}" for w, kl in pts))
 
     ga_points = [(p.removed, p.validated_kl, "GA+rotations") for p in res_rot.points]
     ga_points += [(p.removed, p.validated_kl, "GA-no-rotations") for p in res_norot.points]
-    plot_path = os.path.join(args.out, "smoke_frontier.png")
+    plot_path = os.path.join(out, "smoke_frontier.png")
     plot_frontiers(ga_points, curves, plot_path,
                    title="Tiny-model MLP pruning frontier (smoke demo)")
     print(f"[smoke] frontier plot -> {plot_path}")
@@ -111,6 +133,31 @@ def main() -> int:
               f"({metrics['fraction_removed']:.1%})")
 
     print(f"[smoke] archive files: {sorted(os.listdir(cfg.search.archive_dir))}")
+
+    # Consolidated machine-readable report for this run folder.
+    import json
+
+    def _p(p):
+        return {
+            "removed": p.removed, "kl": p.kl, "validated_kl": p.validated_kl,
+            "rotations": [r.to_tuple() for r in p.genome.rotations],
+            "pruned": sorted(p.genome.pruned),
+        }
+
+    report = {
+        "out": out,
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ga_rotations": [_p(p) for p in res_rot.points],
+        "ga_no_rotations": [_p(p) for p in res_norot.points],
+        "baselines": {
+            name: {vname: [list(pt) for pt in pts] for vname, pts in sets.items()}
+            for name, sets in curves.items()
+        },
+    }
+    report_path = os.path.join(out, "run_results.json")
+    with open(report_path, "w") as fh:
+        json.dump(report, fh, indent=2)
+    print(f"[smoke] results saved -> {report_path}")
     print("[smoke] DONE")
     return 0
 

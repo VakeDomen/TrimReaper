@@ -21,7 +21,11 @@ from .baselines import (
     weight_norm_ranking,
 )
 from .config import Config
-from .evaluate import baseline_logits, evaluate_candidate
+from .evaluate import (
+    baseline_logits,
+    evaluate_candidate,
+    evaluate_pruned_on_set,
+)
 from .model import PrunedModel
 
 
@@ -32,39 +36,54 @@ def baseline_curves(
     streamer,
     widths: list[int] | None = None,
     seed: int = 0,
-) -> dict[str, list[tuple[int, float]]]:
-    """Return {method: [(channels_removed, kl), ...]} for non-GA baselines."""
+    val_batches: list | None = None,
+    test_batches: list | None = None,
+) -> dict[str, dict]:
+    """Return per-method baseline curves evaluated on the SAME sets as the GA.
+
+    Fix: previously the one-shot baselines were scored on a single fresh
+    fitness batch, so they were NOT comparable to the GA's validation-KL. Now
+    every method is measured on the same ``val_batches`` (and optionally the
+    untouched ``test_batches``), giving apples-to-apples numbers.
+
+    Returns: {method: {"val": [(w, kl), ...], "test": [(w, kl), ...]}}.
+    """
     import random
 
     rng = random.Random(seed)
     seq_len = cfg.data.seq_len
-    fit_batch = cfg.data.fit_batch
     if widths is None:
         widths = [cfg.search.start_target, cfg.search.start_target + cfg.search.ratchet_step]
 
-    batch = streamer.batch(fit_batch, seq_len)
-    ref = baseline_logits(pm, [batch], seq_len)[0]
+    # probe batches for activation magnitude (on the pristine model; not part
+    # of the scored validation/test sets).
     probe_batches = [streamer.batch(4, seq_len) for _ in range(4)]
 
     wnorm = weight_norm_ranking(pm, layer)
     amag = activation_magnitude_ranking(pm, layer, probe_batches, seq_len)
     rand = random_ranking(pm.pristine[layer]["up_proj"].shape[0], rng)
 
-    results: dict[str, list[tuple[int, float]]] = {
-        "random": [], "weight_norm": [], "activation_magnitude": [],
-    }
     maps = {"random": rand, "weight_norm": wnorm, "activation_magnitude": amag}
+    set_map = {"val": val_batches, "test": test_batches}
+    results: dict[str, dict[str, list[tuple[int, float]]]] = {}
     for method, order in maps.items():
+        results[method] = {"val": [], "test": []}
         for w in widths:
             pruned = order[:w]
-            kl = evaluate_candidate(pm, batch, ref, layer, [], pruned, seq_len)
-            results[method].append((w, kl))
+            if val_batches:
+                results[method]["val"].append(
+                    (w, evaluate_pruned_on_set(pm, val_batches, layer, pruned, seq_len))
+                )
+            if test_batches:
+                results[method]["test"].append(
+                    (w, evaluate_pruned_on_set(pm, test_batches, layer, pruned, seq_len))
+                )
     return results
 
 
 def plot_frontiers(
     ga_points: list[tuple[int, float, str]],  # (removed, kl, label)
-    baseline_points: dict[str, list[tuple[int, float]]],
+    baseline_points: dict[str, dict[str, list[tuple[int, float]]]],  # method -> {"val"/"test" -> pts}
     out_path: str,
     title: str = "MLP width-pruning Pareto frontier",
 ) -> str:
@@ -79,7 +98,11 @@ def plot_frontiers(
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 6))
     markers = {"random": "x", "weight_norm": "s", "activation_magnitude": "D"}
-    for name, pts in baseline_points.items():
+    for name, sets in baseline_points.items():
+        # plot the validation curve (same set as GA) by default
+        pts = sets.get("val") or sets.get("test") or []
+        if not pts:
+            continue
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         ax.plot(xs, ys, marker=markers.get(name, "o"), label=name, linestyle="--")

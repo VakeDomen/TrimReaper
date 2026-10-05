@@ -26,7 +26,16 @@ class WikiTextStreamer:
 
     Randomly samples a start offset in a shuffled list of tokenized documents,
     then produces contiguous windows of ``seq_len`` tokens.
+
+    The fitness pool uses ``cfg.data.split`` (normally ``train``). The fixed
+    VALIDATION and TEST sets come from WikiText's OWN ``validation`` and
+    ``test`` splits, so the three pools are genuinely disjoint corpora (fix:
+    sampling random windows from one shared pool let validation/test overlap,
+    letting the search leak into the test set via repeated peeking).
     """
+
+    # name (used internally) -> wiki split id
+    _FIXED_SPLITS = {"validation": "validation", "test": "test"}
 
     def __init__(self, cfg: Config, split: str | None = None, holdout: bool = False):
         self.cfg = cfg
@@ -36,6 +45,13 @@ class WikiTextStreamer:
         self._rng = torch.Generator().manual_seed(cfg.data.seed)
         self._lock = threading.Lock()
         self._docs: list[torch.Tensor] | None = None   # None => not loaded yet
+        self._sub: dict[str, "WikiTextStreamer"] = {}
+
+    def _fixed_streamer(self, split: str) -> "WikiTextStreamer":
+        """A dedicated streamer over a disjoint fixed wiki split."""
+        if split not in self._sub:
+            self._sub[split] = WikiTextStreamer(self.cfg, split=split)
+        return self._sub[split]
 
     # -- lazy loading -----------------------------------------------------
     def _ensure_docs(self) -> None:
@@ -48,7 +64,8 @@ class WikiTextStreamer:
             streaming=(":stream" in self._split),
         )
         # Build a corpus list of tokenized documents. For non-streaming this
-        # materializes in memory; for large corpora prefer streaming with a
+        # materializes in memory; for the fixed validation/test splits the
+        # corpus is small, for large fitness corpora prefer streaming with a
         # cap via ds.skip(...).take(...).
         tok = self._tokenizer()
 
@@ -70,15 +87,6 @@ class WikiTextStreamer:
             if cap and len(docs) >= cap:
                 break
         self._docs = docs
-        # Shuffle + holdout split deterministically using the generator.
-        perm = torch.randperm(len(docs), generator=self._rng)
-        n_hold = max(1, int(len(docs) * 0.1)) if self._holdout else 0
-        # For holdout=false we still need a deterministic ordering.
-        if n_hold:
-            self._holdout_idx = set(perm[:n_hold].tolist())
-            self._docs = [d for i, d in enumerate(docs) if i not in self._holdout_idx]
-        else:
-            self._docs = docs
 
     def _tokenizer(self):
         from transformers import AutoTokenizer
@@ -110,21 +118,20 @@ class WikiTextStreamer:
         return torch.stack(seqs).long()
 
     def holdout_batches(self) -> list[torch.Tensor]:
-        """Return the fixed VALIDATION set as a list of (fit_batch, seq_len) tensors.
+        """Return the fixed VALIDATION set (from WikiText's 'validation' split).
 
-        Used by the search to accept/ratchet records. Distinct windows are
-        drawn sequentially from the seeded RNG, so calling ``test_batches()``
-        afterwards yields different windows (disjoint by construction).
+        Used by the search to accept/ratchet records. Genuinely disjoint from
+        the train-based fitness pool and from the test set.
         """
-        return self._fixed_windows(self.cfg.data.holdout_seq)
+        return self._fixed_streamer("validation")._fixed_windows(self.cfg.data.holdout_seq)
 
     def test_batches(self) -> list[torch.Tensor]:
-        """Return the untouched TEST set as a list of (fit_batch, seq_len) tensors.
+        """Return the untouched TEST set (from WikiText's 'test' split).
 
         Never used during search; evaluated only on recorded genomes for the
-        final report so search can't overfit to it via repeated peeking.
+        final report.
         """
-        return self._fixed_windows(self.cfg.data.test_seq)
+        return self._fixed_streamer("test")._fixed_windows(self.cfg.data.test_seq)
 
     def _fixed_windows(self, n: int) -> list[torch.Tensor]:
         self._ensure_docs()

@@ -31,6 +31,7 @@ genome:
 ga:
   population: 32
   elitism: 2
+  tournament_size: 4
   mutation_rate: 0.3
   add_rotation_p: 0.15
   remove_rotation_p: 0.10
@@ -46,6 +47,7 @@ ga:
 search:
   epsilon: 0.01           # max allowed held-out KL divergence
   rounds: 60              # generations per ratchet target
+  valid_best_k: 3         # top-K candidates validated each gen
   start_target: 32        # channels removed at ratchet start
   ratchet_step: 32
   max_target: 0           # 0 = cap at the layer's MLP width

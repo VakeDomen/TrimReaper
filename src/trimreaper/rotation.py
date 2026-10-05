@@ -1,20 +1,31 @@
-"""Pairwise Givens rotations on Qwen MLP channels.
+"""Pairwise Givens rotations on Qwen MLP hidden channels.
 
-Implements PLAN.md section 3. For two MLP hidden channels ``i`` and ``j``:
+Implements PLAN.md section 3, corrected for gated (SwiGLU) MLPs.
 
-    R(theta) = [ cos(theta)  -sin(theta) ]
-               [ sin(theta)   cos(theta) ]
+For two MLP hidden channels ``i`` and ``j``, the geometric idea is to rotate
+the *post-SwiGLU hidden activation* and counter-rotate the projection that
+reads it, so the function is EXACTLY preserved when no channel is masked:
 
-Applied consistently to the three matrices of a gated MLP:
+    gate_proj ─┐
+               ├─ SiLU(gate) * up ── h ── ROT(Q) ── MASK ── down_proj'
+    up_proj ───┘                    down_proj' = down_proj . Q   (Q orthogonal)
 
-    gate_proj rows [i, j]  <- R @ gate_proj[i, j]        (2560 -> 9728)
-    up_proj   rows [i, j]  <- R @ up_proj[i, j]          (2560 -> 9728)
-    down_proj cols [i, j]  <- down_proj[:, i, j] @ R^T   (9728 -> 2560)
+    h' = h @ Q            (rotate the hidden activation)
+    down_proj' = down_proj @ Q
 
-If the MLP were linear this would preserve the function exactly; Qwen's Multi
-Layer Perceptron is gated SiLU, so the transform is NOT exactly invariant --
-that is intentional (the GA must find rotations that change the nonlinear
-model very little yet concentrate information so channels become deletable).
+Because Q is orthogonal, with the mask disabled:
+
+    down_proj'(h') = (h @ Q) @ (down_proj @ Q)^T
+                   = h @ Q @ Q^T @ down_proj^T = h @ down_proj^T = down_proj(h)
+
+so the transform is function-preserving up to floating point roundoff. This is
+a genuine basis rotation of the representation (unlike rotating the raw
+gate/up rows, which is NOT invariant once SiLU is applied). Deleting a channel
+afterwards deletes a ROTATED coordinate, which is where the redundancy-
+concentration payoff comes from.
+
+The rotations are composed into a single orthogonal matrix ``Q`` endowed with
+``h' = h @ Q``; ``down_proj`` is then transformed as ``W_down @ Q``.
 """
 
 from __future__ import annotations
@@ -25,8 +36,7 @@ from typing import Optional
 
 import torch
 
-# Qwen gated-MLP matrix names. These are forwarded into the wrapper's
-# parameter map so a Rotator works against {gate,up,down} projection tensors.
+# Qwen gated-MLP matrix names.
 GATE, UP, DOWN = "gate_proj", "up_proj", "down_proj"
 MLP_MATRICES = (GATE, UP, DOWN)
 
@@ -54,18 +64,51 @@ class PairRotation:
 
 
 def givens_matrix(angle: float, device=None, dtype=None) -> torch.Tensor:
-    """Return the 2x2 Givens rotation matrix R(angle)."""
+    """Return the 2x2 Givens rotation matrix for an h' = h @ R convention."""
     c = math.cos(angle)
     s = math.sin(angle)
-    return torch.tensor([[c, -s], [s, c]], device=device, dtype=dtype)
+    # For x' = x @ M with M = [[c, s], [-s, c]], we get
+    #   x'_a = c x_a - s x_b,  x'_b = s x_a + c x_b.   (standard +theta rotation)
+    return torch.tensor([[c, s], [-s, c]], device=device, dtype=dtype)
+
+
+def make_orthogonal_matrix(width: int, rots: list[PairRotation], device=None, dtype=None) -> torch.Tensor:
+    """Compose a sequence of Givens rotations into one orthogonal matrix Q.
+
+    Returns ``Q`` of shape (width, width) such that applying the rotations to a
+    hidden vector is ``x' = x @ Q``. Rotations are applied left-to-right, so
+    the result is ``I @ M_1 @ M_2 @ ...`` (later rotations act last on x).
+    """
+    Q = torch.eye(width, device=device, dtype=dtype)
+    for rot in rots:
+        a, b, ang = rot.a, rot.b, rot.angle
+        c = math.cos(ang)
+        s = math.sin(ang)
+        # Embed the 2x2 [[c, s], [-s, c]] block into rows/cols (a, b) by
+        # right-multiplying: new row_a = c row_a + s row_b and
+        #                     new row_b = -s row_a + c row_b.
+        Q = Q.clone()
+        row_a = c * Q[a] + s * Q[b]
+        row_b = -s * Q[a] + c * Q[b]
+        Q[a] = row_a
+        Q[b] = row_b
+    return Q
+
+
+def rotate_down_weight(down: torch.Tensor, Q: torch.Tensor) -> torch.Tensor:
+    """Counter-rotate down_proj to stay consistent with an h' = h @ Q rotation.
+
+    ``down`` has shape (hidden, width); returns ``down @ Q``. Together with
+    ``x' = x @ Q`` this preserves ``down_proj(h)`` exactly (Q orthogonal).
+    """
+    return down @ Q
 
 
 def apply_pair_rotation(params: dict[str, torch.Tensor], rot: PairRotation) -> None:
-    """Apply one rotation IN-PLACE to the MLP weight tensors in ``params``.
+    """[LEGACY, only for tests/linear-MLP paths] Rotate gate/up rows + down cols.
 
-    ``params`` maps matrix name -> weight, each with channel dim as follows:
-        gate_proj / up_proj: shape (out_channels, in_features) -> rows i,j
-        down_proj:           shape (in_features, out_channels) -> cols i,j
+    Kept for backward compatibility with the old (linear-only) semantics. New
+    code should use make_orthogonal_matrix + rotate_down_weight + a hidden hook.
     """
     a, b, angle = rot.a, rot.b, rot.angle
     dev = next(iter(params.values())).device
@@ -77,23 +120,17 @@ def apply_pair_rotation(params: dict[str, torch.Tensor], rot: PairRotation) -> N
     u = params[UP]
     d = params[DOWN]
 
-    # Rows [i,j] of a (N, K) matrix. New rows = R @ old_rows (2,K).
-    #   new_row_i = c*row_i - s*row_j
-    #   new_row_j = s*row_i + c*row_j
     idx = torch.tensor([a, b], device=dev)
     for mat in (g, u):
-        rows = mat[idx]                     # (2, K)
+        rows = mat[idx]
         mat[idx] = R @ rows
 
-    # Columns [i,j] of a (K, N) matrix. New cols = old_cols @ R^T.
-    #   new_col_i = c*col_i - s*col_j
-    #   new_col_j = s*col_i + c*col_j
-    cols = d[:, idx]                        # (K, 2)
+    cols = d[:, idx]
     d[:, idx] = cols @ Rt
 
 
 def apply_rotation_sequence(params: dict[str, torch.Tensor], rots: list[PairRotation]) -> None:
-    """Apply a sequence of rotations in order, IN-PLACE on ``params``."""
+    """[LEGACY] Apply a sequence of rotations in order, IN-PLACE on ``params``."""
     for rot in rots:
         apply_pair_rotation(params, rot)
 

@@ -35,11 +35,17 @@ def kl_divergence(logits_a: torch.Tensor, logits_b: torch.Tensor) -> float:
     """Token-averaged KL(softmax(a) || softmax(b)).
 
     ``a`` = original (reference) distribution, ``b`` = candidate.
-    Returns a scalar float.
+
+    Both logits are cast to FP32 before the softmax/log-softmax math: with BF16
+    inference the top-1 probability is ~1.0 and the divergences measured
+    (~1e-3..1e-2) are far smaller than BF16's ~3e-3 resolution, so computing in
+    low precision would wash out the signal. Returns a scalar float.
     """
-    log_pa = F.log_softmax(logits_a, dim=-1)
-    pa = F.softmax(logits_a, dim=-1)
-    log_pb = F.log_softmax(logits_b, dim=-1)
+    a = logits_a.float()
+    b = logits_b.float()
+    log_pa = F.log_softmax(a, dim=-1)
+    pa = F.softmax(a, dim=-1)
+    log_pb = F.log_softmax(b, dim=-1)
     kl = (pa * (log_pa - log_pb)).sum(dim=-1)
     return float(kl.mean().item())
 
@@ -141,3 +147,18 @@ def evaluate_genome_on_set(
         sorted(genome.pruned),
         seq_len,
     )
+
+
+def evaluate_pruned_on_set(
+    pm: PrunedModel,
+    batches: list[torch.Tensor],
+    layer: int,
+    pruned: list[int],
+    seq_len: int,
+) -> float:
+    """Evaluate a plain channel set (no rotations) on an arbitrary set.
+
+    Used by the one-shot baselines (random / weight-norm / activation-magnitude)
+    which carry no rotations.
+    """
+    return _stream_kl(pm, batches, layer, [], sorted(pruned), seq_len)

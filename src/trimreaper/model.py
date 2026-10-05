@@ -1,12 +1,17 @@
 """Model loading and MLP mask/rotation management.
 
-Implements PLAN.md sections 2 and 4:
-  - Load a HF causal LM (BF16) without keeping a second full model in memory.
-  - Keep a pristine copy of each *target MLP's* three weight tensors so
-    candidates can restore + apply rotations cheaply.
-  - During search, do NOT physically delete channels. Instead simulate
-    deletion via a forward pre-hook on each target MLP's ``down_proj`` that
-    zeros the hidden-channel activations in place (hidden[channel] = 0).
+Implements PLAN.md sections 2 and 4, with the corrected rotation semantics:
+
+  - The experimental rotation acts on the POST-SwiGLU hidden activation, not on
+    the raw gate/up weight rows. Composing the Givens rotations into an
+    orthogonal matrix Q and applying ``x' = x @ Q`` right before ``down_proj``
+    is EXACTLY function-preserving when ``down_proj``'s weight is counter-
+    rotated by the same Q (``W_down @ Q``); with the mask disabled the MLP
+    output is unchanged up to floating-point roundoff. This is a true basis
+    rotation of the representation.
+  - During search we do NOT physically delete channels; we simulate deletion
+    by a forward pre-hook on each target MLP's ``down_proj`` that first rotates
+    the hidden activation (``x @ Q``) then zeros the deleted (rotated) channels.
   - Physical compaction is a separate step (compaction.py) for final genomes.
 """
 
@@ -20,7 +25,14 @@ import torch
 import torch.nn as nn
 
 from .config import Config
-from .rotation import DOWN, GATE, UP, PairRotation, apply_rotation_sequence
+from .rotation import (
+    DOWN,
+    GATE,
+    UP,
+    PairRotation,
+    make_orthogonal_matrix,
+    rotate_down_weight,
+)
 
 MLP_MATRICES = (GATE, UP, DOWN)
 
@@ -107,7 +119,7 @@ def wrap_target_mlps(pm: PrunedModel, layers: list[int]) -> None:
         pristine = {}
         for name in MLP_MATRICES:
             w = getattr(mlp, name).weight
-            pristine[name] = w.data.detach().clone().cpu()
+            pristine[name] = w.data.detach().clone()
         pm.pristine[layer_idx] = pristine
 
 
@@ -118,60 +130,86 @@ class PrunedModel:
     model: nn.Module
     config: Config
     tokenizer: Optional[object] = None
-    # layer index -> pristine (untouched) weight tensors for the 3 matrices
+    # layer index -> pristine (untouched) weight tensors for the 3 matrices.
+    # These live on the SAME device as the model (kept on GPU, no per-candidate
+    # PCIe round-trips of 100+ MB of weights).
     pristine: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict)
     # layer index -> module reference to the MLP (for hooks)
     mlp_modules: dict[int, nn.Module] = field(default_factory=dict)
     _hooks: list = field(default_factory=list)
-    _masks: dict[int, torch.Tensor] = field(default_factory=dict)  # layer -> bool mask over channels
+    _masks: dict[int, torch.Tensor] = field(default_factory=dict)      # layer -> bool mask over ROTATED channels
+    _rotations: dict[int, Optional[torch.Tensor]] = field(default_factory=dict)  # layer -> Q or None
 
+    # ---- restoration ----------------------------------------------------
     def restore_all(self) -> None:
-        """Restore every target MLP to its pristine weights."""
+        """Restore every target MLP to its pristine weights and clear hooks."""
         for layer, mats in self.pristine.items():
             for name in MLP_MATRICES:
-                mat = mats[name]
-                getattr(self.mlp_modules[layer], name).weight.data.copy_(mat)
+                getattr(self.mlp_modules[layer], name).weight.data.copy_(mats[name])
+        self._rotations.clear()
+        self._masks.clear()
+        self._refresh_hooks()
 
     def clear_all_masks(self) -> None:
-        """Remove every pruning mask and its hooks (returns to unmasked)."""
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
+        """Remove every pruning mask (but keep any installed rotations)."""
         self._masks.clear()
+        self._refresh_hooks()
 
+    # ---- rotations / masks ---------------------------------------------
     def apply_rotations(self, layer: int, rots: list[PairRotation]) -> None:
-        """Apply a rotation sequence to one layer's MLP (must be pristine)."""
+        """Install a rotation Q (h' = h @ Q) + counter-rotated down_proj.
+
+        ``gate``/``up`` stay pristine (rotating raw rows would break gated SiLU
+        invariance). Instead Q acts on the hidden activation in the forward
+        hook and ``down_proj`` is transformed as ``W_down @ Q``, making the
+        MLP output exactly preserved when no channel is masked.
+        """
         mlp = self.mlp_modules[layer]
-        params = {name: getattr(mlp, name).weight.data for name in MLP_MATRICES}
-        apply_rotation_sequence(params, rots)
+        w = self.pristine[layer]
+        width = w[UP].shape[0]
+        dev = w[UP].device
+        dt = w[UP].dtype
+        if not rots:
+            self._rotations[layer] = None
+            mlp.down_proj.weight.data.copy_(w[DOWN])
+        else:
+            q = make_orthogonal_matrix(width, rots, device=dev, dtype=dt)
+            self._rotations[layer] = q
+            down_rot = rotate_down_weight(w[DOWN].to(dev), q)
+            mlp.down_proj.weight.data.copy_(down_rot)
+        self._refresh_hooks()
 
     def set_mask(self, layer: int, pruned: list[int], width: int | None = None) -> None:
-        """Set the deletion mask for a layer to the (zeroed) pruned channels."""
+        """Set the deletion mask for a layer (over ROTATED channels)."""
         if width is None:
             width = self.pristine[layer][UP].shape[0]
-        mask = torch.ones(width, dtype=torch.bool, device=self.model.device)
+        mask = torch.ones(width, dtype=torch.bool, device=self.pristine[layer][UP].device)
         for c in pruned:
-            mask[c] = False  # False -> hidden channel is zeroed
+            mask[c] = False  # False -> rotated hidden channel is zeroed
         self._masks[layer] = mask
-        self._update_hooks()
+        self._refresh_hooks()
 
-    def _update_hooks(self) -> None:
+    def _refresh_hooks(self) -> None:
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
-        for layer, mask in self._masks.items():
-            mlp = self.mlp_modules[layer]
+        for layer, mlp in self.mlp_modules.items():
+            q = self._rotations.get(layer)
+            mask = self._masks.get(layer)
+            width = self.pristine[layer][UP].shape[0]
 
-            def make_fn(mask_ref):
+            def make_fn(q_ref, mask_ref, w_ref):
                 def fn(mod, args):
                     x = args[0]
-                    keep = mask_ref
-                    # x: (batch, seq, intermediate) — zero deleted channels.
-                    if x.shape[-1] != keep.shape[0]:
+                    # x: (batch, seq, width) hidden input to down_proj.
+                    if x.dim() < 2 or x.shape[-1] != w_ref:
                         return x
-                    x = x.masked_fill(~keep.to(x.device), 0.0)
+                    if q_ref is not None:
+                        x = x @ q_ref.to(x.device)      # rotate hidden basis
+                    if mask_ref is not None:
+                        x = x.masked_fill(~mask_ref.to(x.device), 0.0)  # zero deleted channels
                     return x
 
                 return fn
 
-            self._hooks.append(mlp.down_proj.register_forward_pre_hook(make_fn(mask)))
+            self._hooks.append(mlp.down_proj.register_forward_pre_hook(make_fn(q, mask, width)))

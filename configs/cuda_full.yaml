@@ -5,6 +5,14 @@
 # channels (~5.3%) of layer 18's MLP and compares GA+rotations vs GA-no-rot
 # vs the three one-shot baselines, each also reported on an untouched test set.
 #
+# Rotation semantics: the Givens composition is applied to the POST-SwiGLU
+# hidden activation (x@Q) with down_proj counter-rotated, so with no mask the
+# transform is EXACTLY function-preserving (this is the corrected, meaningful
+# version — the old gate/up-row rotation was NOT invariant under SiLU).
+#
+# Validation and test come from WikiText's OWN validation/test splits, so they
+# are genuinely disjoint from the train-based fitness pool.
+#
 # Launch on a machine where the GPU is actually visible:
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 #   .venv/bin/python -m trimreaper.cli --config configs/cuda_full.yaml run
@@ -26,11 +34,11 @@ model:
 data:
   dataset: "Salesforce/wikitext"
   dataset_config: "wikitext-103-raw-v1"
-  split: "train"
+  split: "train"            # fitness pool (WikiText train)
   seq_len: 256              # random contiguous token windows (PLAN sec 8)
   fit_batch: 4              # 4 sequences x 256 tokens per fitness forward
-  holdout_seq: 128          # VALIDATION set (search picks records on it)
-  test_seq: 64              # untouched TEST set (final report only)
+  holdout_seq: 128          # VALIDATION set (WikiText 'validation' split; search picks records on it)
+  test_seq: 64              # untouched TEST set (WikiText 'test' split; final report only)
   num_workers: 2
   seed: 0
   max_docs: 2000            # 0 = unlimited; caps CPU-bound wikitext tokenization
@@ -45,8 +53,9 @@ genome:
   delete_survive_bias: 0.7         # rotate delete<->survive pairs (PLAN sec 6)
 
 ga:
-  population: 1000            # 32-64 candidates (PLAN sec 7)
+  population: 1000            # candidates per generation (PLAN sec 7)
   elitism: 2
+  tournament_size: 4          # tournament selection: best of k for each parent
   mutation_rate: 0.3
   add_rotation_p: 0.15
   remove_rotation_p: 0.10
@@ -64,6 +73,7 @@ search:
   # Set epsilon high so every target level records instead of being rejected.
   epsilon: 0.5
   rounds: 50                # generations at the fixed target (per GA method)
+  valid_best_k: 3           # top-K (by fitness) candidates validation-scored each gen
   start_target: 512         # fixed level: delete 512/9728 channels (~5.3%)
   ratchet_step: 256         # unused while start==max; used only if ratcheting
   max_target: 512           # == start_target => single fixed level, no ratchet

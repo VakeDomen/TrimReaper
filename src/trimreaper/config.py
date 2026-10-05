@@ -83,6 +83,7 @@ class GaConfig:
 
     population: int = 32
     elitism: int = 2
+    tournament_size: int = 4       # tournament selection: best of k parents
     mutation_rate: float = 0.3
     add_rotation_p: float = 0.15
     remove_rotation_p: float = 0.10
@@ -102,6 +103,7 @@ class SearchConfig:
 
     epsilon: float = 0.01           # max allowed held-out KL divergence
     rounds: int = 60                # generations run per ratchet target (0=anytime/run-forever)
+    valid_best_k: int = 3           # top-K candidates (by fitness) validated per generation
     start_target: int = 32          # channels to remove to start ratchet
     ratchet_step: int = 32          # increment on success
     max_target: int = 0             # 0 = unlimited

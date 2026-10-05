@@ -1,0 +1,53 @@
+# TrimReaper proof-of-concept config (Qwen3-4B-Base, layer 18).
+# Override any field on the CLI: --data.seq_len=128 --ga.population=16 etc.
+
+model:
+  model_id: "Qwen/Qwen3-4B-Base"
+  dtype: "bfloat16"
+  device: ""                # "" = auto (cuda if available else cpu)
+  low_cpu_mem_usage: true
+  layers: [18]
+
+data:
+  dataset: "Salesforce/wikitext"
+  dataset_config: "wikitext-103-raw-v1"
+  split: "train"
+  seq_len: 256
+  fit_batch: 4
+  holdout_seq: 128          # VALIDATION set
+  test_seq: 64              # untouched TEST set
+  num_workers: 2
+  seed: 0
+  max_docs: 2000            # 0 = unlimited; caps CPU-bound wikitext tokenization
+
+genome:
+  min_rotations: 16
+  max_rotations: 640
+  rotations_per_removed: 0.5    # budget = clamp(0.5*target, 16, 640)
+  min_angle: -6.283185307179586
+  max_angle: 6.283185307179586
+  delete_survive_bias: 0.7
+
+ga:
+  population: 32
+  elitism: 2
+  mutation_rate: 0.3
+  add_rotation_p: 0.15
+  remove_rotation_p: 0.10
+  angle_mutate_p: 0.5
+  angle_mutate_std: 0.15
+  large_angle_p: 0.05
+  large_angle_std: 1.0
+  replace_a_p: 0.2
+  replace_b_p: 0.2
+  flip_prune_p: 0.2
+  seed: 0
+
+search:
+  epsilon: 0.01           # max allowed held-out KL divergence
+  rounds: 60              # generations per ratchet target
+  start_target: 32        # channels removed at ratchet start
+  ratchet_step: 32
+  max_target: 0           # 0 = cap at the layer's MLP width
+  penalty_scale: 10.0
+  archive_dir: "runs/archive"

@@ -1,0 +1,71 @@
+# TrimReaper CUDA config — serious proof-of-concept run on Qwen3-4B-Base.
+#
+# Focus: does pairwise Givens rotation help channel pruning at MEANINGFUL
+# compression (not the token 32-channel case)? Default deletes 512 / 9728
+# channels (~5.3%) of layer 18's MLP and compares GA+rotations vs GA-no-rot
+# vs the three one-shot baselines, each also reported on an untouched test set.
+#
+# Launch on a machine where the GPU is actually visible:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   .venv/bin/python -m trimreaper.cli --config configs/cuda_full.yaml run
+#
+# Fixed-target curve (recommended workflow) — re-run with a different target:
+#   --search.start_target=256 --search.max_target=256
+#   --search.start_target=512 --search.max_target=512
+#   --search.start_target=1024 --search.max_target=1024
+# (start==max disables the ratchet; one level is searched for `rounds` gens.)
+# Add --ga.seed=1 / 2 / 3 for independent seeds.
+
+model:
+  model_id: "Qwen/Qwen3-4B-Base"
+  dtype: "bfloat16"
+  device: "cuda"            # pinned to GPU — do not auto-fall back to CPU
+  low_cpu_mem_usage: true
+  layers: [18]              # single middle layer for the first POC (PLAN sec 5)
+
+data:
+  dataset: "Salesforce/wikitext"
+  dataset_config: "wikitext-103-raw-v1"
+  split: "train"
+  seq_len: 256              # random contiguous token windows (PLAN sec 8)
+  fit_batch: 4              # 4 sequences x 256 tokens per fitness forward
+  holdout_seq: 128          # VALIDATION set (search picks records on it)
+  test_seq: 64              # untouched TEST set (final report only)
+  num_workers: 2
+  seed: 0
+  max_docs: 2000            # 0 = unlimited; caps CPU-bound wikitext tokenization
+
+genome:
+  min_rotations: 16                # floor on the rotation budget
+  max_rotations: 640               # hard ceiling (allows up to ~640 rotations)
+  rotations_per_removed: 0.5       # budget = clamp(0.5*target, 16, 640)
+                                   #   target=256 -> 128, 512 -> 256, 1024 -> 512
+  min_angle: -6.283185307179586    # +/- 2pi
+  max_angle: 6.283185307179586
+  delete_survive_bias: 0.7         # rotate delete<->survive pairs (PLAN sec 6)
+
+ga:
+  population: 1000            # 32-64 candidates (PLAN sec 7)
+  elitism: 2
+  mutation_rate: 0.3
+  add_rotation_p: 0.15
+  remove_rotation_p: 0.10
+  angle_mutate_p: 0.5
+  angle_mutate_std: 0.15    # small Gaussian angle mutations
+  large_angle_p: 0.05       # occasional large angle for exploration
+  large_angle_std: 1.0
+  replace_a_p: 0.2
+  replace_b_p: 0.2
+  flip_prune_p: 0.2
+  seed: 0
+
+search:
+  # We are collecting the KL-vs-removed CURVE, NOT gatekeeping on epsilon yet.
+  # Set epsilon high so every target level records instead of being rejected.
+  epsilon: 0.5
+  rounds: 50                # generations at the fixed target (per GA method)
+  start_target: 512         # fixed level: delete 512/9728 channels (~5.3%)
+  ratchet_step: 256         # unused while start==max; used only if ratcheting
+  max_target: 512           # == start_target => single fixed level, no ratchet
+  penalty_scale: 10.0
+  archive_dir: "runs/archive"

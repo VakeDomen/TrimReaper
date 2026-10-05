@@ -6,11 +6,14 @@ from trimreaper.config import Config
 from trimreaper.ga import (
     Genome,
     Individual,
+    clone_genome,
     crossover,
     fitness_value,
     make_random_genome,
     mutate,
+    mutate_from_self,
     mutate_mask,
+    rebase_explorer,
     rotation_budget,
     tournament_parent,
 )
@@ -153,3 +156,45 @@ def test_config_override_and_validate():
     from trimreaper.config import validate
 
     validate(cfg)  # should not raise
+
+
+def test_fail_limit_default():
+    """Independent-explorer mode: a candidate re-bases after fail_limit gens."""
+    assert Config.defaults().ga.fail_limit == 5
+
+
+def test_clone_genome_keeps_or_refreshes_id():
+    cfg = _cfg()
+    rng = random.Random(9)
+    base = make_random_genome(cfg, width=40, target=4, rng=rng)
+    keep = clone_genome(base, keep_id=True)
+    assert keep.id == base.id
+    assert set(keep.pruned) == base.pruned
+    assert [r.to_tuple() for r in keep.rotations] == [r.to_tuple() for r in base.rotations]
+    # keep_id=False -> a fresh identity, independent memory
+    fresh = clone_genome(base, keep_id=False)
+    assert fresh.id != keep.id
+    fresh.rotations = []
+    assert base.rotations  # independent copy unaffected
+
+
+def test_mutate_from_self_no_crossover_single_parent():
+    """Each explorer mutates ONLY from itself (single self-parent, fresh id)."""
+    cfg = _cfg()
+    rng = random.Random(11)
+    base = make_random_genome(cfg, width=40, target=4, rng=rng)
+    child = mutate_from_self(cfg, base, 40, 4, rng)
+    assert child.id != base.id
+    assert child.parent_ids == [base.id]           # one self-parent, never two
+    assert len(child.pruned) == 4                  # mask kept + target preserved
+
+
+def test_rebase_explorer_copies_and_mutates_base():
+    """A stuck explorer is re-based onto a base: copy + mutate, fresh id."""
+    cfg = _cfg()
+    rng = random.Random(13)
+    base = make_random_genome(cfg, width=40, target=4, rng=rng)
+    rebased = rebase_explorer(cfg, base, 40, 4, rng)
+    assert rebased.id != base.id
+    assert rebased.parent_ids == [base.id]
+    assert len(rebased.pruned) == 4

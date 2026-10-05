@@ -30,16 +30,18 @@ from .data import WikiTextStreamer
 from .evaluate import (
     baseline_logits,
     evaluate_candidate,
-    evaluate_genome_on_set,
 )
 from .ga import (
     GARandom,
     Genome,
     Individual,
+    clone_genome,
     coverage_stats,
     fitness_value,
-    make_child_population,
     make_random_genome,
+    mutate_from_self,
+    rebase_explorer,
+    tournament_parent,
 )
 from .diversity import (
     elite_lineage_frac,
@@ -358,6 +360,16 @@ def ratchet_search(
         # the elite-lineage fraction over the last ``lineage_lookback`` gens.
         parent_maps: list[dict[int, set[int]]] = []
 
+        # Independent-explorer mode (no crossover, no tournament every gen).
+        # The population is NOT a breeding pool: each candidate is an explorer
+        # that mutates ONLY from itself, generation after generation. A global
+        # elite (snapshot of the best genome seen) is the comparison reference.
+        # A candidate that goes `fail_limit` consecutive gens without beating
+        # the elite gets re-based onto a tournament-selected base + mutated.
+        global_elite: Optional[Individual] = None
+        tsize = getattr(cfg.ga, "tournament_size", 4)
+        fail_limit = getattr(cfg.ga, "fail_limit", 5)
+
         # print the legend once, before the first generation
         _emit_legend(tag=_variant_tag(variant))
 
@@ -368,34 +380,80 @@ def ratchet_search(
             ref = baseline_logits(pm, [batch], seq_len)[0]
             ref_safe = ref.clone() if ref is not None else None
 
+            # ---- evaluate every explorer's CURRENT genome on today's batch.
+            # The global-elite reference (if any) is evaluated in the SAME call
+            # so the elite-KL and each candidate's KL come from the identical
+            # evaluator/rounding — a fair same-batch comparison (this is what
+            # makes the fast and slow paths deterministic and defines "beats the
+            # elite" without ambiguity).
+            eval_genomes = [ind.genome for ind in population]
+            have_elite = global_elite is not None
+            if have_elite:
+                eval_genomes = [global_elite.genome] + eval_genomes
             if ref_safe is not None and cfg.search.use_fast_eval:
-                # ---- fast path: cache the pre-MLP prefix once, then score ALL
-                # candidates in ONE batched tail forward (no weight mutation).
+                # fast path: cache the pre-MLP prefix once, then score ALL
+                # genomes in ONE batched tail forward (no weight mutation).
                 from .fast_eval import build_cache, eval_genomes_batched
 
                 cache = build_cache(pm, batch, layer, seq_len)
                 kls = eval_genomes_batched(
-                    cache, pm, layer, [ind.genome for ind in population], seq_len,
+                    cache, pm, layer, eval_genomes, seq_len,
                     chunk=cfg.search.fast_eval_chunk,  # 0 = auto-size from free VRAM
                 )
             else:
                 kls = [
                     evaluate_candidate(
                         pm, batch, ref_safe, layer,
-                        (ind.genome.rotations if use_rotations else []),
-                        sorted(ind.genome.pruned), seq_len,
+                        (g.rotations if use_rotations else []),
+                        sorted(g.pruned), seq_len,
                     ) if ref_safe is not None else float("inf")
-                    for ind in population
+                    for g in eval_genomes
                 ]
+
+            if have_elite:
+                elite_kl = kls[0]
+                kls = kls[1:]
+            else:
+                elite_kl = float("inf")
 
             for ind, kl in zip(population, kls):
                 ind.kl = kl
                 ind.removed = len(ind.genome.pruned)
                 ind.fitness = fitness_value(cfg, kl, ind.removed)
 
+            # ---- fair same-batch comparison against the global elite ----
+            if global_elite is None:
+                # first generation: crown the best founder as the elite, so
+                # there is a reference to beat from gen 1 on.
+                best_ind = min(population, key=lambda i: i.fitness)
+                global_elite = Individual(
+                    genome=clone_genome(best_ind.genome, keep_id=True),
+                    fitness=best_ind.fitness, kl=best_ind.kl, removed=best_ind.removed,
+                )
+                for ind in population:
+                    ind.fail_count = 0
+            else:
+                for ind in population:
+                    if ind.kl < elite_kl:
+                        # candidate beat the elite on the SAME batch -> new elite,
+                        # and this explorer has proven itself: reset its counter.
+                        global_elite = Individual(
+                            genome=clone_genome(ind.genome, keep_id=True),
+                            fitness=ind.fitness, kl=ind.kl, removed=ind.removed,
+                        )
+                        ind.fail_count = 0
+                    else:
+                        ind.fail_count += 1
+
             # ---- stable objective: validate top-K on the VALIDATION set ----
+            # NOTE: the archive decision MUST use ONE authoritative evaluator so
+            # that the fast and slow search paths agree on WHICH genome is best.
+            # The batched fast evaluator is the production/GPU validator; the
+            # per-genome fitness KLs may differ from it at the ~1e-8 level, which
+            # is fine for ranking within a generation but would flip archive
+            # records that are validated by different evaluators across paths.
             top = sorted(population, key=lambda i: i.fitness)[:valid_best_k]
-            if cfg.search.use_fast_eval and top:
+            if top:
                 from .fast_eval import build_cache, eval_genomes_batched
 
                 top_genomes = [ind.genome for ind in top]
@@ -411,11 +469,6 @@ def ratchet_search(
                     n_b += 1
                 for ind, a in zip(top, acc):
                     ind.validated_kl = (a / n_b) if n_b else float("nan")
-            else:
-                for ind in top:
-                    ind.validated_kl = evaluate_genome_on_set(
-                        pm, val_batches, layer, ind.genome, seq_len
-                    )
 
             for ind in top:
                 vkl = ind.validated_kl
@@ -436,7 +489,7 @@ def ratchet_search(
                     result.best_removed = max(result.best_removed, ind.removed)
                     _save_archive(cfg, layer, archived, archive_dir, variant)
 
-            best = min(population, key=lambda i: i.fitness)
+            best = global_elite if global_elite is not None else min(population, key=lambda i: i.fitness)
             av = archive.get(target)
 
             # ---- compact per-generation log (reviewer's format) ----
@@ -483,16 +536,28 @@ def ratchet_search(
                          arch_kl=av.validated_kl if av else float("nan"),
                          diversity=div)
 
-            # produce the next generation (tournament selection inside)
-            population = [
-                Individual(genome=g)
-                for g in make_child_population(cfg, population, width, target, rng, fixed_pruned)
-            ]
-            if not use_rotations:
-                for ind in population:
-                    ind.genome.rotations = []
+            # ---- evolve each explorer ONCE for the next generation ----
+            # Re-based (stuck) explorers already carry a fresh mutated copy of a
+            # tournament-selected base; everyone else self-mutates from itself.
+            for ind in population:
+                if ind.fail_count >= fail_limit:
+                    base = tournament_parent(population, tsize, rng)
+                    ind.genome = rebase_explorer(
+                        cfg, base.genome, width, target, rng, fixed_pruned)
+                    if not use_rotations:
+                        ind.genome.rotations = []
+                    ind.fail_count = 0
+                    ind.kl = float("inf")
+                    ind.fitness = float("inf")
+                else:
+                    ind.genome = mutate_from_self(
+                        cfg, ind.genome, width, target, rng, fixed_pruned)
+                    if not use_rotations:
+                        ind.genome.rotations = []
+                    ind.kl = float("inf")
+                    ind.fitness = float("inf")
 
-            # record this generation's parent links (after breeding) for lineage
+            # record this generation's parent links (after evolution) for lineage
             parent_maps.append({})
             for ind in population:
                 g = ind.genome

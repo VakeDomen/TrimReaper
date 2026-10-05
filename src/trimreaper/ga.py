@@ -79,6 +79,7 @@ class Individual:
     kl: float = float("inf")
     removed: int = 0                # channels removed (for objective bookkeeping)
     validated_kl: float = float("nan")  # holdout-validated KL
+    fail_count: int = 0             # consecutive gens without beating the global elite
 
 
 class GARandom:
@@ -237,6 +238,55 @@ def mutate_mask(cfg: Config, genome: Genome, width: int, rng: random.Random,
             add = rng.choice(survivors)
             g.pruned.remove(drop)
             g.pruned.add(add)
+    return g
+
+
+def clone_genome(genome: Genome, keep_id: bool = True) -> Genome:
+    """Return an independent copy of a genome.
+
+    ``keep_id=True`` preserves the lineage id/parent_ids (used when a candidate
+    is crowned the global elite: the snapshot keeps the id it was born with so
+    ancestry stays traceable). ``keep_id=False`` gives a fresh identity.
+    """
+    g = Genome(rotations=list(genome.rotations), pruned=set(genome.pruned))
+    g.id = genome.id if keep_id and genome.id is not None else _next_genome_id()
+    g.parent_ids = list(genome.parent_ids)
+    return g
+
+
+def mutate_from_self(cfg: Config, genome: Genome, width: int, target: int,
+                     rng: random.Random, fixed_pruned: Optional[set] = None) -> Genome:
+    """Independent-explorer evolution: a candidate mutates ONLY from itself.
+
+    No crossover, no other parent. The child inherits both the rotations and
+    the pruned mask of its sole self-parent, then every mutation operator
+    (angle / replace-endpoint / add / remove / mask-flip) applies. Returns the
+    new genome with a fresh identity whose single parent is ``genome``.
+    """
+    g = mutate(cfg, genome, width, target, rng, fixed_pruned)
+    g = mutate_mask(cfg, g, width, rng, fixed_pruned)
+    if fixed_pruned is None:
+        g.with_target_pruned(target, rng, width)
+    g.id = _next_genome_id()
+    g.parent_ids = [genome.id] if genome.id is not None else []
+    return g
+
+
+def rebase_explorer(cfg: Config, base: Genome, width: int, target: int,
+                    rng: random.Random, fixed_pruned: Optional[set] = None) -> Genome:
+    """Rebase a stuck explorer onto a tournament-selected base and mutate it.
+
+    The fresh genome copies ``base`` then mutates (single self-parent ``base``),
+    giving the rescued candidate a new path. Used only when a candidate has
+    failed ``cfg.ga.fail_limit`` consecutive generations without beating the
+    global elite.
+    """
+    g = mutate(cfg, base, width, target, rng, fixed_pruned)
+    g = mutate_mask(cfg, g, width, rng, fixed_pruned)
+    if fixed_pruned is None:
+        g.with_target_pruned(target, rng, width)
+    g.id = _next_genome_id()
+    g.parent_ids = [base.id] if base.id is not None else []
     return g
 
 

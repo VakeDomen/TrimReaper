@@ -92,6 +92,10 @@ class GaConfig:
     population: int = 32
     elitism: int = 2
     tournament_size: int = 4       # tournament selection: best of k parents
+    # Independent-explorer mode (no crossover): a candidate that goes this many
+    # consecutive generations without beating the global elite (same-batch KL)
+    # is re-based onto a tournament-selected base and starts a fresh path.
+    fail_limit: int = 5
     mutation_rate: float = 0.3
     add_rotation_p: float = 0.15
     remove_rotation_p: float = 0.10

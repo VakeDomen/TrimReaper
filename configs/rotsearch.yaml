@@ -53,9 +53,10 @@ genome:
   delete_survive_bias: 0.95       # STRONGLY prefer deleted<->kept (cross-boundary) rotations
 
 ga:
-  population: 32
+  population: 32            # 32 independent explorers (each self-mutates, no crossover)
   elitism: 2
-  tournament_size: 2
+  tournament_size: 2          # for REBASING a stuck explorer (best of k bases)
+  fail_limit: 5              # gens without beating the global elite before a re-base
   mutation_rate: 0.8
   add_rotation_p: 0.15
   remove_rotation_p: 0.10

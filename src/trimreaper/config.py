@@ -160,6 +160,12 @@ class AnalysisConfig:
     n_exact: int = 1
     n_small: int = 8
     n_large: int = 8
+    # Number of calibration probe batches used to collect the post-SwiGLU hidden
+    # activations (for the importance score AND the PCA sweep). With
+    # fit_batch*seq_len tokens per batch this sizes the calibration: e.g.
+    # fit_batch=4, seq_len=256 -> 4 batches = 4096 tokens. Tune by watching when
+    # the selected weakest-N mask stops changing much (1/2/4/8/16 batches).
+    probe_batches: int = 4
 
 
 @dataclass

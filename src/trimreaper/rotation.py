@@ -76,26 +76,38 @@ def make_orthogonal_matrix(width: int, rots: list[PairRotation], device=None, dt
     """Compose a sequence of Givens rotations into one orthogonal matrix Q.
 
     Returns ``Q`` of shape (width, width) such that applying the rotations to a
-    hidden vector is ``x' = x @ Q``. Rotations are applied left-to-right, so
-    the result is ``I @ M_1 @ M_2 @ ...`` (later rotations act last on x).
+    hidden vector is ``x' = x @ Q``. Rotations are applied **left-to-right**
+    (in the listed order): the hidden vector is transformed by each rotation in
+    turn, ``x' = (...((x @ M_1) @ M_2) ... @ M_n)``, equivalently
+    ``Q = M_1 @ M_2 @ ... @ M_n`` where M_i is the block-diagonal embedding of
+    the i-th Givens on rows/cols (a_i, b_i).
+
+    Sequential application of a Givens on (a, b) updates exactly the two hidden
+    coordinates:
+        h'_a = c h_a - s h_b
+        h'_b = s h_a + c h_b
+    For ``h' = h @ Q`` this is achieved by RIGHT-multiplying Q's identity by
+    each M_i, which updates the two **(a, b) COLUMNS**: because ``h'[:,j] =
+    sum_i h[:,i] Q[i,j]``, rotating coordinates (a, b) rewrites columns a and b
+    as
+        Q[:, a] = c old_a - s old_b
+        Q[:, b] = s old_a + c old_b
+
+    IMPORTANT (perf): clone ONLY the two columns being changed, never the whole
+    matrix — O(width) work per rotation instead of O(width^2) — critical at
+    1000+ rotations on a 9728-wide MLP. (A row-update implementation would
+    silently REVERSE the composition order; columns are what make the listed
+    order equal the applied order.)
     """
     Q = torch.eye(width, device=device, dtype=dtype)
     for rot in rots:
         a, b, ang = rot.a, rot.b, rot.angle
         c = math.cos(ang)
         s = math.sin(ang)
-        # Embed the 2x2 [[c, s], [-s, c]] block into rows/cols (a, b) by
-        # right-multiplying: new row_a = c old_a + s old_b and
-        #                     new row_b = -s old_a + c old_b.
-        # IMPORTANT (perf): clone ONLY the two rows being changed, never the
-        # whole matrix. Rows a and b depend on each other's OLD values, so we
-        # snapshot them before writing either. This turns an O(width^2) full-Q
-        # clone per rotation into O(width) work per rotation — critical at
-        # 1000+ rotations on a 9728-wide MLP.
-        old_a = Q[a].clone()
-        old_b = Q[b].clone()
-        Q[a] = c * old_a + s * old_b
-        Q[b] = -s * old_a + c * old_b
+        old_a = Q[:, a].clone()
+        old_b = Q[:, b].clone()
+        Q[:, a] = c * old_a - s * old_b
+        Q[:, b] = s * old_a + c * old_b
     return Q
 
 

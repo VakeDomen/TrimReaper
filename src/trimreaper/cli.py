@@ -430,7 +430,8 @@ def cmd_extract(args) -> int:
     target = min(target, width)
 
     # ---- calibration pass: collect post-SwiGLU hidden over probe batches ----
-    probe_batches = [streamer.batch(cfg.data.fit_batch, seq_len) for _ in range(4)]
+    n_probe = max(1, int(cfg.analysis.probe_batches))
+    probe_batches = [streamer.batch(cfg.data.fit_batch, seq_len) for _ in range(n_probe)]
     pm.restore_all()
     hidden: list[torch.Tensor] = []
 
@@ -445,7 +446,7 @@ def cmd_extract(args) -> int:
     finally:
         handle.remove()
     H = torch.cat(hidden, dim=0) if hidden else torch.empty(0, width)
-    log(f"calibration hidden collected: {H.shape[0]} tokens")
+    log(f"calibration hidden collected: {H.shape[0]} tokens ({n_probe} probe batches)")
 
     # ---- 1) importance + fixed mask ----
     score = channel_importance([H], pm.pristine[layer]["down_proj"])
@@ -492,6 +493,11 @@ def cmd_extract(args) -> int:
         pm, cfg, layer, streamer, val_batches, use_rotations=True,
         progress=None, archive_dir=run_dir, variant="ga_pca",
         seed_genome=pca_genome,
+        seed_config={
+            "n_exact": cfg.analysis.n_exact,
+            "n_small": cfg.analysis.n_small,
+            "n_large": cfg.analysis.n_large,
+        },
     )
     klD_val = res.points[0].validated_kl if res.points else float("nan")
     bg = res.best_genome

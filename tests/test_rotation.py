@@ -82,10 +82,12 @@ def test_make_orthogonal_matrix_is_orthogonal_by_rows():
     assert torch.allclose(((v @ Q) ** 2).sum(), (v ** 2).sum(), atol=1e-9)
 
 
-def test_make_orthogonal_matches_reference_rows_only():
-    """Regression: the row-only clone optimization must reproduce the exact
+def test_make_orthogonal_matches_reference_columns():
+    """Regression: the column-only clone optimization must reproduce the exact
     matrix produced by a reference naive implementation (clone whole Q each
-    step), so identical rotations yield identical Q."""
+    step), so identical rotations yield identical Q. The reference uses COLUMN
+    updates (right-multiplication) which is what makes the listed rotation order
+    equal the applied order."""
     import math
 
     from trimreaper.rotation import PairRotation, make_orthogonal_matrix
@@ -98,13 +100,50 @@ def test_make_orthogonal_matches_reference_rows_only():
         for r in rots:
             c, s = math.cos(r.angle), math.sin(r.angle)
             old = Q.clone()
-            Q[r.a] = c * old[r.a] + s * old[r.b]
-            Q[r.b] = -s * old[r.a] + c * old[r.b]
+            Q[:, r.a] = c * old[:, r.a] - s * old[:, r.b]
+            Q[:, r.b] = s * old[:, r.a] + c * old[:, r.b]
         return Q
 
     q_new = make_orthogonal_matrix(width, rots, dtype=torch.float64)
     q_ref = reference(width, rots)
     assert torch.allclose(q_new, q_ref, atol=1e-12)
+
+
+def test_make_orthogonal_applies_in_listed_order_overlapping_pairs():
+    """Regression for the Q composition ORDER bug.
+
+    The builder must apply rotations left-to-right (in the listed order). A
+    row-update implementation silently left-multiplies and therefore REVERSES
+    the sequence. Overlapping pairs (0,1),(1,2),(0,2) do NOT commute, so they
+    expose the ordering error where disjoint pairs would not: applying the same
+    rotations as a sequential column transform (matching the evaluator) and as
+    one composed x@Q must give the same hidden vector."""
+    import math
+
+    from trimreaper.rotation import PairRotation, make_orthogonal_matrix
+
+    width = 4
+    rots = [PairRotation(0, 1, 0.7), PairRotation(1, 2, -0.5), PairRotation(0, 2, 1.2)]
+    X = torch.randn(50, width, dtype=torch.float64)
+
+    def apply_seq(x, seq):
+        y = x.clone()
+        for r in seq:
+            a, b, ang = r.a, r.b, r.angle
+            c, s = math.cos(ang), math.sin(ang)
+            oa = y[:, a].clone()
+            ob = y[:, b].clone()
+            y[:, a] = c * oa - s * ob
+            y[:, b] = s * oa + c * ob
+        return y
+
+    # sequential forward application = the order the evaluator actually applies
+    expected = apply_seq(X, rots)
+    Q = make_orthogonal_matrix(width, rots, dtype=torch.float64)
+    torch.testing.assert_close(X @ Q, expected, atol=1e-9, rtol=1e-9)
+    # and NOT the reversed order
+    reversed_ = apply_seq(X, list(reversed(rots)))
+    assert not torch.allclose(X @ Q, reversed_, atol=1e-6)
 
 
 def test_rows_and_cols_transform_as_documented():

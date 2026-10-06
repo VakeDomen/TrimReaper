@@ -117,6 +117,18 @@ def test_local_pca_angle_zeroes_shared_direction():
     assert float((Y[:, d] ** 2).mean()) < 0.05  # nearly all energy moved out
 
 
+def test_analysis_config_defaults():
+    """The analytical pre-analysis defaults: weak channels auto-included,
+    GA-seed tiers non-trivial, calibration size configurable."""
+    a = Config.defaults().analysis
+    assert a.skip_bottom == 0            # weakest channels included by default
+    assert a.max_rows == 2048
+    assert (a.n_exact, a.n_small, a.n_large) == (1, 8, 8)
+    assert a.probe_batches == 4
+    # probe_batches is controllable
+    assert Config(analysis=type(a)(probe_batches=8)).analysis.probe_batches == 8
+
+
 def test_seed_population_from_counts_tiers_and_frozen_mask():
     cfg = Config()
     cfg.ga.population = 20

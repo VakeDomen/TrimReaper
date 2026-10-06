@@ -94,6 +94,8 @@ analysis:
   n_exact: 1              # GA-seed tiers around the analytical solution
   n_small: 8
   n_large: 8
+  probe_batches: 4        # calibration probe batches (fit_batch*seq_len tokens each)
+                          #   yield example tokens: *1024 / 2=2048 / 4=4096 / 8=8192 / 16=16384
 
 search:
   # We are collecting the KL-vs-removed CURVE, NOT gatekeeping on epsilon yet.

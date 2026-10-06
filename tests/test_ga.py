@@ -8,12 +8,9 @@ from trimreaper.ga import (
     Individual,
     assigned_mutation_fracs,
     clone_genome,
-    crossover,
     fitness_value,
     make_random_genome,
-    mutate,
     mutate_from_self,
-    mutate_mask,
     rebase_explorer,
     rotation_budget,
     tournament_parent,
@@ -38,6 +35,17 @@ def test_random_genome_respects_bounds():
     assert len(g.pruned) == 10
     for rot in g.rotations:
         assert 0 <= rot.a < 100 and 0 <= rot.b < 100 and rot.a != rot.b
+
+
+def test_random_genome_fixed_rotation_count():
+    """Every genome gets EXACTLY rotation_budget(target) rotations (no length
+    evolution / no initial_rotation_frac drift), so genomes are comparable."""
+    cfg = _cfg()
+    rng = random.Random(7)
+    expect = rotation_budget(cfg, 10)   # clamp(0.5*10, 4, 8) = 5
+    for _ in range(50):
+        g = make_random_genome(cfg, width=100, target=10, rng=rng)
+        assert len(g.rotations) == expect, (len(g.rotations), expect)
 
 
 def test_random_genome_mask_before_rotations():
@@ -71,21 +79,6 @@ def test_tournament_parent_favors_fitness():
     assert wins[id(pop[1])] == 200
 
 
-def test_crossover_mask_keeps_intersection_and_target():
-    """Controlled mask crossover: preserves the parental intersection and ends
-    at exactly the target size."""
-    cfg = _cfg()
-    rng = random.Random(4)
-    pa_pruned = {0, 1, 2, 3, 4, 5, 6, 7}
-    pb_pruned = {2, 3, 4, 5, 8, 9, 10, 11}
-    pa = Genome(rotations=[], pruned=set(pa_pruned))
-    pb = Genome(rotations=[], pruned=set(pb_pruned))
-    child = crossover(cfg, pa, pb, width=100, target=6, rng=rng)
-    # Intersection {2,3,4,5} preserved entirely (it's within target).
-    assert {2, 3, 4, 5} <= child.pruned
-    assert len(child.pruned) == 6
-
-
 def test_rotation_budget_scales_with_target():
     """Larger deletion targets must get more rotational freedom (clamped)."""
     cfg = _cfg()  # min=4, max=8, rotations_per_removed defaults to 0.5
@@ -113,31 +106,6 @@ def test_with_target_pruned_resizes():
     assert len(g.pruned) == 3
 
 
-def test_mutate_produces_valid_genome():
-    cfg = _cfg()
-    rng = random.Random(2)
-    base = make_random_genome(cfg, width=50, target=4, rng=rng)
-    seen = set()
-    for _ in range(200):
-        m = mutate(cfg, base, 50, 4, rng)
-        # deterministic-ish: never returns the identical object
-        seen.add(tuple(rr.to_tuple() for rr in m.rotations))
-        for rot in m.rotations:
-            assert rot.a != rot.b
-    assert len(seen) > 1  # actually mutates
-
-
-def test_crossover_respects_target_count():
-    cfg = _cfg()
-    rng = random.Random(3)
-    pa = make_random_genome(cfg, width=80, target=8, rng=rng)
-    pb = make_random_genome(cfg, width=80, target=9, rng=rng)
-    child = crossover(cfg, pa, pb, 80, target=7, rng=rng)
-    assert len(child.pruned) == 7
-    for rot in child.rotations:
-        assert rot.a != rot.b
-
-
 def test_fitness_value_penalty_ordering():
     cfg = _cfg()
     cfg.search.epsilon = 0.01
@@ -151,9 +119,10 @@ def test_fitness_value_penalty_ordering():
 
 def test_config_override_and_validate():
     cfg = Config.defaults()
-    cfg.override({"ga.population": 16, "data.seq_len": 128})
+    cfg.override({"ga.population": 16, "data.seq_len": 128, "mutation.mask_swap_count": 2})
     assert cfg.ga.population == 16
     assert cfg.data.seq_len == 128
+    assert cfg.mutation.mask_swap_count == 2
     from trimreaper.config import validate
 
     validate(cfg)  # should not raise
@@ -201,44 +170,55 @@ def test_rebase_explorer_copies_and_mutates_base():
     assert len(rebased.pruned) == 4
 
 
-def test_angle_mutate_frac_default():
-    """Reviewer fix #3: independent-explorer mutation targets ~5% of angles per
-    generation by default (angle_mutate_frac)."""
-    assert Config.defaults().ga.angle_mutate_frac == 0.05
+def test_mutation_config_defaults():
+    """The minimal mutation schema has the reviewer's defaults."""
+    m = Config.defaults().mutation
+    assert m.angle_fraction_min == 0.003
+    assert m.angle_fraction_max == 0.10
+    assert m.pair_rewire_fraction == 0.02
+    assert m.mask_swap_count == 1
+    assert m.mask_swap_probability == 0.20
+
+
+def test_mutate_from_self_keeps_fixed_rotation_count():
+    """No add/remove rotation mutations: the child keeps EXACTLY the parent's
+    rotation count."""
+    cfg = _cfg()
+    rng = random.Random(17)
+    parent = make_random_genome(cfg, width=40, target=4, rng=rng)
+    n0 = len(parent.rotations)
+    for _ in range(200):
+        child = mutate_from_self(cfg, parent, 40, 4, rng)
+        assert len(child.rotations) == n0
+        assert len(child.pruned) == 4
 
 
 def test_mutate_from_self_mutation_is_guaranteed():
-    """Reviewer fix #3: in independent-explorer mode mutation must happen 100%
-    of the time (no mutation_rate gate), so EVERY child differs from its parent
-    — not just on the flip of a coin. Across many draws every child must change
-    at least its angles."""
+    """Mutation must happen 100% of the time (no mutation_rate gate): EVERY
+    child differs from its parent, even with all probabilistic operators gated
+    off (only the guaranteed angle mutation remains)."""
     cfg = _cfg()
-    cfg.ga.angle_mutate_frac = 0.5        # force many angle changes for a clean check
-    cfg.ga.replace_a_p = 0.0              # isolate the angle path
-    cfg.ga.replace_b_p = 0.0
-    cfg.ga.add_rotation_p = 0.0
-    cfg.ga.remove_rotation_p = 0.0
-    cfg.ga.flip_prune_p = 0.0             # no mask swap; isolate angle mutation
+    cfg.mutation.angle_fraction_max = 0.5   # force many angle changes for a clean check
+    cfg.mutation.angle_fraction_min = 0.5
+    cfg.mutation.mask_swap_probability = 0.0   # disable mask swap (probabilistic)
+    cfg.mutation.pair_rewire_fraction = 0.0    # disable pair rewire (probabilistic)
     rng = random.Random(21)
     parent = make_random_genome(cfg, width=40, target=4, rng=rng)
     assert len(parent.rotations) >= 1
     for _ in range(200):
         child = mutate_from_self(cfg, parent, 40, 4, rng)
-        # every child must have mutated its angles (100% guaranteed) even though
-        # every other mutation operator is disabled.
         p_angles = [r.angle for r in parent.rotations]
         c_angles = [r.angle for r in child.rotations]
         assert c_angles != p_angles, "angle mutation must fire 100% of the time"
 
 
 def test_mask_mutation_then_repair_keeps_cross_boundary():
-    """Reviewer fix #4: mask mutation happens FIRST, then rotations are repaired
-    against the new mask. With the flip gate forced on, a rotation straddling a
-    swapped channel must end up back on the correct side (or remain valid), and
-    every rotation must stay a != b."""
+    """Mask swap happens in place, rotations are repaired against the new mask,
+    and every rotation stays a != b with the exact target preserved."""
     cfg = _cfg()
-    cfg.ga.flip_prune_p = 1.0             # ALWAYS swap one pruned -> surviving
-    cfg.ga.delete_survive_bias = 1.0      # repair re-draws strictly cross-boundary
+    cfg.mutation.mask_swap_probability = 1.0   # ALWAYS swap
+    cfg.mutation.mask_swap_count = 1
+    cfg.genome.delete_survive_bias = 1.0       # repair re-draws strictly cross-boundary
     rng = random.Random(31)
     for _ in range(100):
         parent = make_random_genome(cfg, width=64, target=8, rng=rng)
@@ -249,6 +229,45 @@ def test_mask_mutation_then_repair_keeps_cross_boundary():
             assert 0 <= rot.a < 64 and 0 <= rot.b < 64
 
 
+def test_mask_swap_is_exact_swap():
+    """A mask swap removes one pruned and adds one kept (exact swap), so the
+    count never changes even with multiple swap attempts."""
+    from trimreaper.ga import _mask_swap
+
+    cfg = _cfg()
+    cfg.mutation.mask_swap_count = 1
+    cfg.mutation.mask_swap_probability = 1.0
+    rng = random.Random(37)
+    for _ in range(100):
+        g = make_random_genome(cfg, width=64, target=8, rng=rng)
+        before = set(g.pruned)
+        changed = _mask_swap(cfg, g, 64, rng)
+        assert len(g.pruned) == 8
+        assert changed, "mask swap must change status when forced"
+        assert (set(g.pruned) ^ before) == changed   # exactly drop+add
+
+
+def test_pair_rewire_changes_planes_keeps_angles():
+    """PAIR rewire re-draws endpoints (new planes) while preserving each
+    rotation's angle, and always yields valid cross-boundary pairs."""
+    from trimreaper.ga import _rewire_pairs
+
+    cfg = _cfg()
+    cfg.mutation.pair_rewire_fraction = 1.0   # rewire every rotation
+    cfg.genome.delete_survive_bias = 1.0      # strict cross-boundary
+    rng = random.Random(43)
+    for _ in range(100):
+        g = make_random_genome(cfg, width=64, target=8, rng=rng)
+        angles_before = [r.angle for r in g.rotations]
+        _rewire_pairs(cfg, g, 64, rng)
+        # angles preserved exactly
+        assert [r.angle for r in g.rotations] == angles_before
+        for rot in g.rotations:
+            assert rot.a != rot.b
+            dead = (rot.a in g.pruned) != (rot.b in g.pruned)
+            assert dead, "rewired pair must cross the pruned/kept boundary"
+
+
 def test_repair_rotations_after_mask_direct():
     """Direct check of the repair step: after swapping a channel, a rotation
     that ended up with both endpoints on the same side is re-drawn to cross the
@@ -257,79 +276,62 @@ def test_repair_rotations_after_mask_direct():
     from trimreaper.rotation import PairRotation
 
     cfg = _cfg()
-    cfg.ga.delete_survive_bias = 1.0
+    cfg.mutation.mask_swap_probability = 1.0
+    cfg.genome.delete_survive_bias = 1.0
     rng = random.Random(7)
     # pruned = {0,1}; rotation (0,5) starts cross-boundary (0 deleted, 5 kept).
     g = Genome(rotations=[PairRotation(0, 5, 0.3)], pruned={0, 1})
-    # Force a swap via the mask mutator on a copy to learn the changed channels.
-    from trimreaper.ga import mutate_mask
-    child = mutate_mask(cfg, g, 64, rng)
-    if child.pruned != {0, 1}:
-        changed = set(g.pruned) ^ set(child.pruned)
-    else:
-        changed = set()
-    repair_rotations_after_mask(cfg, child, 64, changed, rng)
-    for rot in child.rotations:
+    changed = _mask_swap(cfg, g, 64, rng)
+    repair_rotations_after_mask(cfg, g, 64, changed, rng)
+    assert len(g.pruned) == 2
+    for rot in g.rotations:
         assert rot.a != rot.b
 
 
 def test_assigned_mutation_fracs_ascending():
-    """Each explorer SLOT gets a fixed ascending rate (1%..32% at pop 32)."""
-    fracs = assigned_mutation_fracs(32, 0.32)
+    """Each explorer SLOT gets a fixed ascending angle fraction (min..max)."""
+    fracs = assigned_mutation_fracs(32, 0.003, 0.10)
     assert len(fracs) == 32
-    assert abs(fracs[0] - 0.01) < 1e-9    # candidate 0 -> 1%
-    assert abs(fracs[-1] - 0.32) < 1e-9   # candidate 31 -> 32%
+    assert abs(fracs[0] - 0.003) < 1e-9    # candidate 0 -> min
+    assert abs(fracs[-1] - 0.10) < 1e-9    # candidate 31 -> max
     assert all(fracs[i] < fracs[i + 1] for i in range(len(fracs) - 1))
-    # a different population still spreads ascending, capped at rate_max
-    fracs16 = assigned_mutation_fracs(16, 0.32)
+    # a different population still spreads ascending, capped at max
+    fracs16 = assigned_mutation_fracs(16, 0.003, 0.10)
     assert len(fracs16) == 16
-    assert abs(fracs16[-1] - 0.32) < 1e-9
+    assert abs(fracs16[-1] - 0.10) < 1e-9
 
 
 def test_mutate_from_self_uses_assigned_frac():
     """The explorer's OWN assigned rate controls how many angles mutate (the
-    rate belongs to the slot; it is NOT the fixed config default)."""
-    from trimreaper.ga import _mutate_angles_guaranteed
-
+    rate belongs to the slot; it is NOT the config min/max default)."""
     cfg = _cfg()
-    cfg.ga.angle_mutate_frac = 0.05        # config default irrelevant to assigned path
-    cfg.ga.replace_a_p = 0.0
-    cfg.ga.replace_b_p = 0.0
-    cfg.ga.add_rotation_p = 0.0
-    cfg.ga.remove_rotation_p = 0.0
-    cfg.ga.flip_prune_p = 0.0              # isolate pure angle mutation
+    cfg.mutation.mask_swap_probability = 0.0
+    cfg.mutation.pair_rewire_fraction = 0.0   # isolate pure angle mutation
     rng = random.Random(41)
     parent = make_random_genome(cfg, width=40, target=4, rng=rng)
     n = len(parent.rotations)
     assert n >= 4
-    # low-rate explorer mutates a small, strictly-positive fraction
+    # high-rate explorer mutates ~50% of angles
     child_hi = mutate_from_self(cfg, parent, 40, 4, rng, mutation_frac=0.5)
     p_angles = [r.angle for r in parent.rotations]
     c_angles = [r.angle for r in child_hi.rotations]
     assert c_angles != p_angles
-    # ~50% of angles should have changed
     changed = sum(1 for pa, ca in zip(p_angles, c_angles) if abs(pa - ca) > 1e-12)
     assert changed >= int(0.45 * n), (changed, n)
 
 
 def test_rebase_keeps_slot_rate_not_donor_rate():
-    """A 20% explorer re-based onto a 5% explorer's genome stays a 20% explorer:
-    the donor's mutation rate is NOT copied to the child."""
+    """A high-rate explorer re-based onto a low-rate donor's genome stays a
+    high-rate explorer: the donor's rate is NOT copied to the child; the child
+    mutates at the SLOT's passed rate."""
     cfg = _cfg()
-    cfg.ga.replace_a_p = 0.0
-    cfg.ga.replace_b_p = 0.0
-    cfg.ga.add_rotation_p = 0.0
-    cfg.ga.remove_rotation_p = 0.0
-    cfg.ga.flip_prune_p = 0.0
+    cfg.mutation.mask_swap_probability = 0.0
+    cfg.mutation.pair_rewire_fraction = 0.0
     rng = random.Random(51)
     donor = make_random_genome(cfg, width=40, target=4, rng=rng)
-    # 'rebase_explorer' takes the SLOT's rate via mutation_frac; the donor rate is
-    # the one passed (0.2), independent of the donor genome.
     rebased = rebase_explorer(cfg, donor, 40, 4, rng, mutation_frac=0.2)
     assert rebased.id != donor.id
     assert rebased.parent_ids == [donor.id]
-    # the Individual carrying the rate is built by the caller — we test the
-    # child's angle-change magnitude corresponds to the passed 0.2 rate.
     d_angles = [r.angle for r in donor.rotations]
     r_angles = [r.angle for r in rebased.rotations]
     n = len(donor.rotations)

@@ -65,16 +65,13 @@ class GenomeConfig:
 
     min_rotations: int = 256
     max_rotations: int = 4096
-    # Rotation budget scales with the deletion target so larger prunes get more
-    # rotational freedom instead of a fixed cap: budget =
+    # Rotation budget scales with the deletion target: budget =
     # clamp(int(rotations_per_removed * target), min_rotations, max_rotations).
-    # Budget ladder for 512 deleted channels (2^x * deleted): 1x=512, 2x=1024,
-    # 4x=2048, 8x=4096 (see the rotsearch rotation_sweep).
+    # Every genome uses EXACTLY this many rotations (a fixed count) so genomes
+    # are directly comparable and we don't evolve complexity at the same time
+    # as the solution. Budget ladder for 512 deleted (2^x * deleted): 1x=512,
+    # 2x=1024, 4x=2048, 8x=4096.
     rotations_per_removed: float = 1.0
-    # Initial genomes start with a substantial rotation count rather than the
-    # bare floor: n_rot ~ uniform in [max(min_rot, ceil(initial_frac*budget)),
-    # budget], so early evolution isn't artificially sparse.
-    initial_rotation_frac: float = 0.75
     min_angle: float = -3.141592653589793 * 2
     max_angle: float = 3.141592653589793 * 2
     # Cross-boundary preference: with this probability, rotation pairs are drawn
@@ -87,43 +84,53 @@ class GenomeConfig:
 
 @dataclass
 class GaConfig:
-    """Genetic algorithm hyperparameters."""
+    """Genetic algorithm / explorer-population hyperparameters."""
 
     population: int = 32
     elitism: int = 2
-    tournament_size: int = 4       # tournament selection: best of k parents
+    tournament_size: int = 2       # best-of-k bases when re-basing a stuck explorer
     # Independent-explorer mode (no crossover): a candidate that goes this many
     # consecutive generations without beating the global elite (same-batch KL)
     # is re-based onto a tournament-selected base and starts a fresh path.
     fail_limit: int = 5
-    # LEGACY-ONLY (used only by the retired crossover make_child_population, still
-    # exercised by unit tests). The independent-explorer path ignores it: mutation
-    # there happens 100% of the time via angle_mutate_frac.
-    mutation_rate: float = 0.3
-    add_rotation_p: float = 0.15
-    remove_rotation_p: float = 0.10
-    # Independent-explorer mode: the fraction of rotation angles mutated EVERY
-    # generation (guaranteed, 100% of the time). Used as the fallback when no
-    # per-explorer mutation_frac is supplied (e.g. unit tests calling
-    # mutate_from_self directly). Active search overrides this with the
-    # per-explorer assigned rate (1%..32%).
-    angle_mutate_frac: float = 0.05
-    # Per-explorer assigned mutation rate. Each candidate slot gets a FIXED,
-    # ascending rate that does NOT change over the run:
-    #   candidate i -> (i + 1) / population * mutation_rate_max
-    # With population=32 and rate_max=0.32 this gives 1%, 2%, ..., 32% — a
-    # spread from cautious to aggressive. The rate controls how many rotation
-    # angles that explorer mutates per generation, and it survives re-basing
-    # (the rate belongs to the slot, not the genome it copies).
-    mutation_rate_max: float = 0.32
-    angle_mutate_p: float = 0.5         # legacy-only (single-angle gate for `mutate`)
-    angle_mutate_std: float = 0.15      # small Gaussian angle mutations
-    large_angle_p: float = 0.05         # occasional large angle mutation
-    large_angle_std: float = 1.0
-    replace_a_p: float = 0.2
-    replace_b_p: float = 0.2
-    flip_prune_p: float = 0.2
     seed: int = 0
+
+
+@dataclass
+class MutationConfig:
+    """The complete mutation schema (what each explorer does per generation).
+
+    Three mutation types, deliberately minimal and non-overlapping:
+        ANGLE  — try a different rotation in the same plane (each explorer got a
+                 fixed assigned rate in [angle_fraction_min, angle_fraction_max]).
+        PAIR   — try a different plane: rewire the endpoints of a fixed fraction
+                 of rotations (always a valid pruned<->kept pair).
+        MASK   — try deleting a different dimension: swap some pruned channels
+                 for kept ones (exact swap, keeps the removal count).
+
+    ANGLE happens 100% of the time (the assigned fraction controls HOW MANY
+    angles). PAIR and MASK are the reviewer's fixed, explorer-independent rates
+    so they don't contaminate the per-explorer angle-mutation comparison.
+    """
+
+    # Per-explorer assigned angle-mutation fraction, linearly spaced across the
+    # population from min to max (e.g. min 0.003 -> max 0.10 across 32 slots:
+    # ~0.3%..10%, i.e. ~1..44 angles on a 440-rotation genome). Fixed per slot,
+    # survives re-basing.
+    angle_fraction_min: float = 0.003
+    angle_fraction_max: float = 0.10
+    # Endpoint rewiring: fraction of rotations whose (a, b) pair is re-drawn as
+    # a fresh pruned<->kept pair each generation (angle preserved).
+    pair_rewire_fraction: float = 0.02
+    # Mask mutation: with mask_swap_probability, swap mask_swap_count pruned
+    # channels for kept ones per generation (exact swap preserves the target).
+    mask_swap_count: int = 1
+    mask_swap_probability: float = 0.20
+    # Angle change distribution: small Gaussian bump (angle_std), with an
+    # occasional large jump (large_angle_probability / large_angle_std).
+    angle_std: float = 0.15
+    large_angle_probability: float = 0.05
+    large_angle_std: float = 1.0
 
 
 @dataclass
@@ -161,6 +168,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     genome: GenomeConfig = field(default_factory=GenomeConfig)
     ga: GaConfig = field(default_factory=GaConfig)
+    mutation: MutationConfig = field(default_factory=MutationConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
 
     @classmethod

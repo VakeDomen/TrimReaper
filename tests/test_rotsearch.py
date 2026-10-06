@@ -5,7 +5,7 @@ import torch
 import pytest
 
 from trimreaper.config import Config, validate
-from trimreaper.ga import coverage_stats, make_random_genome, make_child_population, GARandom
+from trimreaper.ga import coverage_stats, make_random_genome, GARandom
 from trimreaper.model import load_tiny_smoke_model
 from trimreaper.pipeline import ratchet_search
 
@@ -77,20 +77,22 @@ def test_make_random_genome_frozen_mask():
         assert g.rotations  # still optimizes rotations
 
 
-def test_make_child_population_frozen_mask():
-    from trimreaper.ga import Genome, Individual
+def test_mutate_from_self_frozen_mask():
+    """In rotation-isolation mode (mask frozen via fixed_pruned), a self-mutated
+    child keeps the fixed mask EXACTLY and only rotations evolve."""
+    from trimreaper.ga import Genome, mutate_from_self
 
     cfg = _cfg()
     frozen = sorted([0, 5, 12, 30, 44, 60, 77, 90])
     rng = GARandom(cfg).python
     width = 128
-    parents = []
-    for _ in range(6):
-        g = make_random_genome(cfg, width, len(frozen), rng, set(frozen))
-        parents.append(Individual(genome=g, fitness=rng.random()))
-    children = make_child_population(cfg, parents, width, len(frozen), rng, set(frozen))
-    for c in children:
-        assert sorted(c.pruned) == frozen
+    g = make_random_genome(cfg, width, len(frozen), rng, set(frozen))
+    assert sorted(g.pruned) == frozen
+    child = mutate_from_self(cfg, g, width, len(frozen), rng, set(frozen))
+    assert sorted(child.pruned) == frozen      # mask frozen exactly
+    assert child.rotations                     # rotations still optimize
+    for rot in child.rotations:
+        assert rot.a != rot.b
 
 
 def test_coverage_stats():

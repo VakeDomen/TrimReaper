@@ -88,17 +88,23 @@ class Individual:
     mutation_frac: float = 0.0
 
 
-def assigned_mutation_fracs(population_size: int, rate_max: float) -> list[float]:
-    """Ascending, fixed per-slot mutation rates for a population.
+def assigned_mutation_fracs(population_size: int, frac_min: float,
+                            frac_max: float) -> list[float]:
+    """Ascending, fixed per-slot assigned angle-mutation fractions.
 
-    candidate i (0-based) -> (i + 1) / population_size * rate_max. With the
-    defaults (population 32, rate_max 0.32) this yields 1%, 2%, ..., 32% — a
-    spread from cautious to aggressive. The list is returned in slot order so
-    slot i keeps its rate for the WHOLE run (even across re-basing).
+    candidate i (0-based) is assigned a fraction linearly spaced from
+    ``frac_min`` to ``frac_max`` across the population, so the explorers span
+    cautious->aggressive. With population 32, frac_min 0.003, frac_max 0.10
+    this is ~0.3%..10%. The list is in slot order, so slot i keeps its rate for
+    the WHOLE run (even across re-basing). The assigned rate controls ONLY
+    angle mutation; pair/mask rates are the same for every explorer.
     """
     if population_size <= 0:
         return []
-    return [(i + 1) / population_size * rate_max for i in range(population_size)]
+    if population_size == 1:
+        return [frac_max]
+    step = (frac_max - frac_min) / (population_size - 1)
+    return [frac_min + i * step for i in range(population_size)]
 
 
 class GARandom:
@@ -183,80 +189,14 @@ def make_random_genome(cfg: Config, width: int, target: int, rng: random.Random,
         target = min(target, width)
         g.pruned = set(rng.sample(range(width), target))
 
-    n_rot_max = rotation_budget(cfg, target)
-    if target > 0 and n_rot_max > 0:
-        # Start with a substantial rotation count near the budget (not the bare
-        # floor), so early evolution isn't artificially sparse. Initial genomes
-        # are uniform in [max(min_rotations, round(initial_frac*budget)), budget].
-        floor = getattr(cfg.genome, "initial_rotation_frac", 0.75)
-        lo = max(cfg.genome.min_rotations, int(floor * n_rot_max))
-        lo = min(lo, n_rot_max)
-        n_rot = rng.randint(lo, n_rot_max)
-    else:
-        n_rot = 0
+    # FIXED rotation count: every genome has EXACTLY rotation_budget(target)
+    # rotations (never added/removed by mutation), so genomes are directly
+    # comparable and we don't evolve rotation-count complexity at the same time
+    # as the solution.
+    n_rot = rotation_budget(cfg, target) if target > 0 else 0
     for _ in range(n_rot):
         a, b = random_rotation_pair(width, g, cfg, rng)
         g.rotations.append(PairRotation(a, b, random_angle(cfg, rng)))
-    return g
-
-
-def mutate(cfg: Config, genome: Genome, width: int, target: int, rng: random.Random,
-           fixed_pruned: Optional[set] = None) -> Genome:
-    """Return a new Genome produced by random mutations (section 7)."""
-    g = Genome(rotations=list(genome.rotations), pruned=set(genome.pruned))
-
-    if g.rotations and rng.random() < cfg.ga.angle_mutate_p:
-        i = rng.randrange(len(g.rotations))
-        rot = g.rotations[i]
-        if rng.random() < cfg.ga.large_angle_p:
-            new_angle = rot.angle + rng.gauss(0, cfg.ga.large_angle_std)
-        else:
-            new_angle = rot.angle + rng.gauss(0, cfg.ga.angle_mutate_std)
-        g.rotations[i] = PairRotation(rot.a, rot.b, new_angle)
-
-    if g.rotations and rng.random() < cfg.ga.replace_a_p:
-        i = rng.randrange(len(g.rotations))
-        rot = g.rotations[i]
-        a = replace_endpoint(width, g, cfg, rng, keep=rot.b)
-        g.rotations[i] = PairRotation(a, rot.b, rot.angle)
-
-    if g.rotations and rng.random() < cfg.ga.replace_b_p:
-        i = rng.randrange(len(g.rotations))
-        rot = g.rotations[i]
-        b = replace_endpoint(width, g, cfg, rng, keep=rot.a)
-        g.rotations[i] = PairRotation(rot.a, b, rot.angle)
-
-    if len(g.rotations) < rotation_budget(cfg, target) and rng.random() < cfg.ga.add_rotation_p:
-        a, b = random_rotation_pair(width, g, cfg, rng)
-        g.rotations.append(PairRotation(a, b, random_angle(cfg, rng)))
-
-    if len(g.rotations) > 0 and rng.random() < cfg.ga.remove_rotation_p:
-        del g.rotations[rng.randrange(len(g.rotations))]
-
-    if fixed_pruned is not None:
-        g.pruned = set(fixed_pruned)   # rotations evolve; mask stays frozen
-    return g
-
-
-def mutate_mask(cfg: Config, genome: Genome, width: int, rng: random.Random,
-                fixed_pruned: Optional[set] = None) -> Genome:
-    """Mutate the pruned-channel mask (section 7 mask mutations).
-
-    In rotation-isolation mode (``fixed_pruned`` given), the mask is frozen and
-    this is a no-op (the genome keeps the fixed mask unchanged).
-    """
-    g = Genome(rotations=list(genome.rotations), pruned=set(genome.pruned))
-    if fixed_pruned is not None:
-        g.pruned = set(fixed_pruned)
-        return g
-    if rng.random() < cfg.ga.flip_prune_p and g.pruned:
-        # swap one pruned for one surviving
-        drop = rng.choice(list(g.pruned))
-        survivors = [c for c in range(width) if c not in g.pruned]
-        if survivors:
-            add = rng.choice(survivors)
-            g.pruned.remove(drop)
-            g.pruned.add(add)
     return g
 
 
@@ -274,17 +214,27 @@ def clone_genome(genome: Genome, keep_id: bool = True) -> Genome:
 
 
 def _mask_swap(cfg: Config, genome: Genome, width: int, rng: random.Random) -> Optional[set]:
-    """Swap one pruned channel for one surviving (if the flip gate fires).
+    """Swap pruned channels for kept ones (mask mutation).
 
-    Returns the set of channel indices whose pruned/kept STATUS changed
-    (the dropped + added channels), or an empty set when nothing changed. The
-    caller uses this to repair rotations that now point at flipped channels.
+    Each of ``mask_swap_count`` iterations independently fires with
+    ``mask_swap_probability`` and swaps ONE pruned channel for ONE kept
+    channel (an exact swap, so the prune count stays exactly `target`). This is
+    "try deleting a different dimension".
+
+    Returns the set of channel indices whose pruned/kept STATUS changed (the
+    dropped + added channels), or an empty set when nothing changed. The caller
+    uses this to repair rotations that now point at flipped channels.
     """
     changed: set = set()
-    if rng.random() < cfg.ga.flip_prune_p and genome.pruned:
-        drop = rng.choice(list(genome.pruned))
-        survivors = [c for c in range(width) if c not in genome.pruned]
-        if survivors:
+    if not genome.pruned:
+        return changed
+    count = max(1, int(cfg.mutation.mask_swap_count))
+    for _ in range(count):
+        if rng.random() < cfg.mutation.mask_swap_probability:
+            drop = rng.choice(list(genome.pruned))
+            survivors = [c for c in range(width) if c not in genome.pruned]
+            if not survivors:
+                continue
             add = rng.choice(survivors)
             genome.pruned.remove(drop)
             genome.pruned.add(add)
@@ -326,51 +276,66 @@ def repair_rotations_after_mask(cfg: Config, genome: Genome, width: int,
 
 def _mutate_angles_guaranteed(cfg: Config, genome: Genome, rng: random.Random,
                               frac: Optional[float] = None) -> None:
-    """Mutate ~``frac`` of rotation angles.
+    """Mutate ~``frac`` of rotation angles — "try a different rotation in the
+    same plane". GUARANTEED to run (independent-explorer mode mutates 100% of
+    the time); the per-explorer assigned ``frac`` controls HOW MANY angles.
 
-    With a ``frac`` given (a per-explorer assigned mutation rate), that fraction
-    is used; otherwise it falls back to ``cfg.ga.angle_mutate_frac`` (the fixed
-    5% default, used by unit tests / legacy callers).
-
-    This is the GUARANTEED mutation: with independent-explorer mode, mutation
-    happens 100% of the time (reviewer fix #3 / assigned-rate experiment). Each
-    selected angle gets the small Gaussian change (``angle_mutate_std``), with
-    an occasional large jump (``large_angle_p`` / ``large_angle_std``) for
-    exploration. Mutating only one angle per generation on ~440-1000 rotations
-    is nearly a no-op, so the per-explorer rate determines how many angles we
-    actually touch: 1% -> ~4 on a 440 genome, 20% -> ~88, 32% -> ~141.
+    Each selected angle gets the small Gaussian change (``mutation.angle_std``),
+    with an occasional large jump (``mutation.large_angle_probability`` /
+    ``mutation.large_angle_std``) for exploration. With ``frac`` given it is the
+    explorer's assigned rate; otherwise it falls back to the midpoint of
+    ``[angle_fraction_min, angle_fraction_max]`` (used by unit tests / legacy
+    callers that don't carry a per-slot rate).
     """
     n = len(genome.rotations)
     if n == 0:
         return
-    frac = frac if frac is not None else getattr(cfg.ga, "angle_mutate_frac", 0.05)
+    if frac is None:
+        frac = (cfg.mutation.angle_fraction_min + cfg.mutation.angle_fraction_max) / 2.0
     n_angle = max(1, min(n, int(round(frac * n))))
     for i in rng.sample(range(n), n_angle):
         rot = genome.rotations[i]
-        if rng.random() < cfg.ga.large_angle_p:
-            new_angle = rot.angle + rng.gauss(0, cfg.ga.large_angle_std)
+        if rng.random() < cfg.mutation.large_angle_probability:
+            new_angle = rot.angle + rng.gauss(0, cfg.mutation.large_angle_std)
         else:
-            new_angle = rot.angle + rng.gauss(0, cfg.ga.angle_mutate_std)
+            new_angle = rot.angle + rng.gauss(0, cfg.mutation.angle_std)
         genome.rotations[i] = PairRotation(rot.a, rot.b, new_angle)
+
+
+def _rewire_pairs(cfg: Config, genome: Genome, width: int, rng: random.Random) -> None:
+    """Rewire a fixed fraction of rotation pairs — "try a different plane".
+
+    Each selected rotation gets BOTH endpoints re-drawn as a fresh,
+    delete<->survive-biased (pruned<->kept) pair; its angle is preserved. This
+    is ONE operation (not separate A/B endpoint mutations): every new pair is
+    guaranteed valid and cross-boundary, so no separate repair is needed.
+    """
+    n = len(genome.rotations)
+    if n == 0:
+        return
+    n_rewire = max(1, min(n, int(round(cfg.mutation.pair_rewire_fraction * n))))
+    for i in rng.sample(range(n), n_rewire):
+        a, b = random_rotation_pair(width, genome, cfg, rng)
+        rot = genome.rotations[i]
+        genome.rotations[i] = PairRotation(a, b, rot.angle)
 
 
 def _mutate_explorer_core(cfg: Config, genome: Genome, width: int, target: int,
                           rng: random.Random,
                           fixed_pruned: Optional[set] = None,
                           mutation_frac: Optional[float] = None) -> Genome:
-    """Independent-explorer mutation engine (reviewer fixes #3 and #4).
+    """Independent-explorer mutation engine.
 
-    Order (fix #4 — mask FIRST, then repair, then angles/endpoints/add/remove):
+    Order (mask FIRST, then repair, then pairs, then angles):
         1. copy the parent genome
-        2. mutate the pruned mask (probabilistic swap)
+        2. mutate the pruned mask (probabilistic exact swaps)
         3. REPAIR rotations against the new mask (fix lost cross-boundary intent)
-        4. mutate angles (GUARANTEED, ~``mutation_frac`` every generation), then
-           the probabilistic endpoint / add / remove operators on top.
+        4. rewire rotation PAIRS (fixed fraction, always valid pruned<->kept)
+        5. mutate ANGLES (GUARANTEED, ~``mutation_frac`` every generation)
 
-    ``mutation_frac`` is the assigned per-explorer rate controlling how many
-    angles get mutated (fallback: ``cfg.ga.angle_mutate_frac``). It is a
-    property of the EXPLORER SLOT and stays with the caller regardless of which
-    genome is being copied.
+    ``mutation_frac`` is the assigned per-explorer angle rate. It is a property
+    of the EXPLORER SLOT and stays with the caller regardless of which genome is
+    being copied. Pair and mask rates are the same for every explorer.
 
     In rotation-isolation mode (``fixed_pruned``), the mask is frozen and only
     rotations evolve (mask mutation is skipped entirely).
@@ -380,28 +345,13 @@ def _mutate_explorer_core(cfg: Config, genome: Genome, width: int, target: int,
     if fixed_pruned is not None:
         g.pruned = set(fixed_pruned)
     else:
-        changed = _mask_swap(cfg, g, width, rng)
-        g.with_target_pruned(target, rng, width)   # keep exactly `target` removed
-    # repair rotations against any mask change, BEFORE touching angles.
+        changed = _mask_swap(cfg, g, width, rng)   # exact swap keeps `target` removed
+    # repair rotations against any mask change (only needed when the mask moved).
     repair_rotations_after_mask(cfg, g, width, changed, rng)
+    # rewire a fixed fraction of rotation pairs (try different planes).
+    _rewire_pairs(cfg, g, width, rng)
     # guaranteed angle mutation (100% of the time) at the explorer's rate.
     _mutate_angles_guaranteed(cfg, g, rng, frac=mutation_frac)
-    # probabilistic extra mutations on top.
-    if g.rotations and rng.random() < cfg.ga.replace_a_p:
-        i = rng.randrange(len(g.rotations))
-        rot = g.rotations[i]
-        a = replace_endpoint(width, g, cfg, rng, keep=rot.b)
-        g.rotations[i] = PairRotation(a, rot.b, rot.angle)
-    if g.rotations and rng.random() < cfg.ga.replace_b_p:
-        i = rng.randrange(len(g.rotations))
-        rot = g.rotations[i]
-        b = replace_endpoint(width, g, cfg, rng, keep=rot.a)
-        g.rotations[i] = PairRotation(rot.a, b, rot.angle)
-    if len(g.rotations) < rotation_budget(cfg, target) and rng.random() < cfg.ga.add_rotation_p:
-        a, b = random_rotation_pair(width, g, cfg, rng)
-        g.rotations.append(PairRotation(a, b, random_angle(cfg, rng)))
-    if g.rotations and rng.random() < cfg.ga.remove_rotation_p:
-        del g.rotations[rng.randrange(len(g.rotations))]
     if fixed_pruned is not None:
         g.pruned = set(fixed_pruned)   # rotations evolve; mask stays frozen
     g.id = _next_genome_id()
@@ -415,12 +365,12 @@ def mutate_from_self(cfg: Config, genome: Genome, width: int, target: int,
 
     No crossover, no other parent. The child inherits both the rotations and
     the pruned mask of its sole self-parent, then the FULL explorer mutation
-    (mask-first + repair + guaranteed angle mutation at the explorer's own rate
-    + probabilistic endpoint/add/remove) applies. Returns the new genome with a
-    fresh identity whose single parent is ``genome``.
+    (mask-first + repair + pair rewire + guaranteed angle mutation at the
+    explorer's own assigned rate) applies. Returns the new genome with a fresh
+    identity whose single parent is ``genome``.
 
-    ``mutation_frac`` is the assigned per-explorer mutation rate (defaults to
-    ``cfg.ga.angle_mutate_frac`` when not supplied).
+    ``mutation_frac`` is the assigned per-explorer angle rate (defaults to the
+    midpoint of the angle-fraction range when not supplied).
     """
     g = _mutate_explorer_core(cfg, genome, width, target, rng, fixed_pruned,
                               mutation_frac=mutation_frac)
@@ -434,61 +384,18 @@ def rebase_explorer(cfg: Config, base: Genome, width: int, target: int,
     """Rebase a stuck explorer onto a tournament-selected base and mutate it.
 
     The fresh genome copies ``base`` then runs the SAME guaranteed explorer
-    mutation (mask-first + repair + angle/endpoint/add/remove), giving the
-    rescued candidate a new path. Used only when a candidate has failed
+    mutation (mask-first + repair + pair rewire + angle), giving the rescued
+    candidate a new path. Used only when a candidate has failed
     ``cfg.ga.fail_limit`` consecutive generations without beating the global
     elite.
 
     ``mutation_frac`` is the ASSIGNED rate of the SLOT being rescued (NOT the
-    base's): the tournament donor's rate is deliberately not copied, so a 20%
-    explorer re-based onto a 5% explorer's genome stays a 20% explorer.
+    base's): the tournament donor's rate is deliberately not copied.
     """
     g = _mutate_explorer_core(cfg, base, width, target, rng, fixed_pruned,
                               mutation_frac=mutation_frac)
     g.parent_ids = [base.id] if base.id is not None else []
     return g
-
-
-def crossover(cfg: Config, pa: Genome, pb: Genome, width: int, target: int, rng: random.Random,
-              fixed_pruned: Optional[set] = None) -> Genome:
-    """Splice/subsample the two parents' rotations; combine + repair masks.
-
-    Returns a child Genome with exactly ``target`` pruned channels.
-
-    Mask crossover (controlled genetic operation): keep the parental
-    INTERSECTION, then fill the remainder from their SYMMETRIC DIFFERENCE at
-    random until ``target`` is reached. This preserves shared good channels and
-    samples disagreement, rather than an arbitrary ``order[:target]`` of a set.
-
-    In rotation-isolation mode (``fixed_pruned`` given), only rotations are
-    crossed over; the child's mask is simply the fixed mask.
-    """
-    child = Genome()
-    na = len(pa.rotations)
-    nb = len(pb.rotations)
-    # splice: take a prefix from A and a random sample from B
-    cut = rng.randrange(0, na + 1) if na else 0
-    take_b = max(0, rng.randrange(0, nb + 1)) if nb else 0
-    child.rotations = list(pa.rotations[:cut]) + list(pb.rotations[max(0, nb - take_b):])
-    # occasionally cap to the scaled rotation budget for this target
-    budget = rotation_budget(cfg, target)
-    if len(child.rotations) > budget:
-        child.rotations = rng.sample(child.rotations, budget)
-
-    if fixed_pruned is not None:
-        child.pruned = set(fixed_pruned)
-        return child
-
-    # controlled mask crossover
-    target = min(target, width)
-    inter = set(pa.pruned) & set(pb.pruned)
-    diff = (set(pa.pruned) ^ set(pb.pruned)) - inter
-    child.pruned = set(list(inter)[:target])   # shared channels first
-    remaining = list(diff) + [c for c in range(width) if c not in (set(pa.pruned) | set(pb.pruned))]
-    while len(child.pruned) < target and remaining:
-        c = remaining.pop(rng.randrange(len(remaining)))
-        child.pruned.add(c)
-    return child
 
 
 def coverage_stats(genome: Genome, width: int | None = None) -> dict:
@@ -542,62 +449,3 @@ def tournament_parent(
     k = min(tournament_size, len(pop))
     contenders = rng.sample(pop, k)
     return min(contenders, key=lambda ind: ind.fitness)
-
-
-def selection(pop: list[Individual], elitism: int, tournament_size: int = 4, rng=None) -> list[Individual]:
-    """Select surviving parents using REAL tournament selection.
-
-    Returns ``elitism`` elite individuals (best by fitness) plus a pool of
-    tournament-selected parents. Lower fitness is better. The returned list
-    drives the next generation's reproduction.
-    """
-    pop_sorted = sorted(pop, key=lambda ind: ind.fitness)
-    elites = pop_sorted[:elitism]
-    parents = list(elites)
-    return parents
-
-
-def make_child_population(
-    cfg: Config, parents: list[Individual], width: int, target: int, rng: random.Random,
-    fixed_pruned: Optional[set] = None,
-) -> list[Genome]:
-    """Produce the next generation's genomes from the surviving parents.
-
-    Each non-elite child is bred from TWO tournament-selected parents (chosen
-    independently from the FULL previous population, best-of-k), so good
-    individuals reproduce more — real selection pressure, not uniform random.
-
-    When ``fixed_pruned`` is given (rotation-isolation mode), the mask is
-    frozen and only rotations evolve.
-    """
-    next_gen: list[Genome] = []
-    elites = sorted(parents, key=lambda ind: ind.fitness)[:cfg.ga.elitism]
-    # keep elites verbatim (retain their lineage id so ancestry is traceable)
-    for e in elites:
-        el = Genome(rotations=list(e.genome.rotations),
-                    pruned=set(fixed_pruned) if fixed_pruned is not None else set(e.genome.pruned),
-                    id=e.genome.id, parent_ids=list(e.genome.parent_ids))
-        next_gen.append(el)
-
-    tsize = getattr(cfg.ga, "tournament_size", 4)
-    while len(next_gen) < cfg.ga.population:
-        if len(parents) < 2:
-            child = make_random_genome(cfg, width, target, rng, fixed_pruned)
-            next_gen.append(child)
-            continue
-        a = tournament_parent(parents, tsize, rng)
-        b = tournament_parent(parents, tsize, rng)
-        if rng.random() < cfg.ga.mutation_rate:
-            child = mutate(cfg, a.genome if a is b else crossover(cfg, a.genome, b.genome, width, target, rng, fixed_pruned),
-                           width, target, rng, fixed_pruned)
-            child = mutate_mask(cfg, child, width, rng, fixed_pruned)
-        else:
-            child = crossover(cfg, a.genome, b.genome, width, target, rng, fixed_pruned)
-        if fixed_pruned is None:
-            child.with_target_pruned(target, rng, width)
-        # fresh identity + record the two parents for lineage tracking
-        child.id = _next_genome_id()
-        child.parent_ids = [a.genome.id, b.genome.id]
-        next_gen.append(child)
-
-    return next_gen

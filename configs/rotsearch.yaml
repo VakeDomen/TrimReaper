@@ -44,37 +44,38 @@ data:
   max_docs: 2000            # 0 = unlimited
 
 genome:
-  min_rotations: 256              # evolvable-length floor (reviewer: min 256)
-  max_rotations: 4096             # hard ceiling for the largest budget (8x=4096)
+  min_rotations: 256              # rotation-budget floor
+  max_rotations: 4096             # rotation-budget ceiling (largest sweep 8x=4096)
   rotations_per_removed: 1.0      # budget = clamp(rpr*target, min, max); overridden per sweep budget
-  initial_rotation_frac: 0.75     # initial genomes start near the budget, not the floor
   min_angle: -6.283185307179586    # +/- 2pi
   max_angle: 6.283185307179586
   delete_survive_bias: 0.95       # STRONGLY prefer deleted<->kept (cross-boundary) rotations
+                                  # Every genome has EXACTLY rotation_budget(target) rotations.
 
 ga:
-  population: 32            # 32 independent explorers (each self-mutates, no crossover)
+  population: 32            # independent explorers (each self-mutates, no crossover)
   elitism: 2
   tournament_size: 2          # for REBASING a stuck explorer (best of k bases)
   fail_limit: 5              # gens without beating the global elite before a re-base
-  # LEGACY-ONLY: used only by the retired crossover path (unit tests). The
-  # independent-explorer search ignores it — mutation happens 100% of the time.
-  mutation_rate: 0.8
-  add_rotation_p: 0.15
-  remove_rotation_p: 0.10
-  # ASSIGNED-RATE experiment: each explorer slot gets a FIXED ascending rate
-  # (i+1)/population*rate_max -> 1%,2%,...,32% at pop 32. Attached to the slot,
-  # survives re-basing; the end report shows which rates win.
-  mutation_rate_max: 0.32
-  angle_mutate_frac: 0.05    # fallback only when no per-explorer rate is supplied
-  angle_mutate_p: 0.5
-  angle_mutate_std: 0.15
-  large_angle_p: 0.05
-  large_angle_std: 1.0
-  replace_a_p: 0.2
-  replace_b_p: 0.2
-  flip_prune_p: 0.2
   seed: 42
+
+mutation:
+  # Per-explorer assigned ANGLE-mutation fraction, linearly spaced min..max
+  # across the population (cautious -> aggressive). Fixed per slot, survives
+  # re-basing; the end report shows which angle rates win. ANGLE happens 100% of
+  # the time — the fraction controls HOW MANY angles change each generation.
+  angle_fraction_min: 0.003
+  angle_fraction_max: 0.10
+  # PAIR rewire: fraction of rotations whose (a,b) get re-drawn as a fresh
+  # pruned<->kept pair each generation (same rate for every explorer).
+  pair_rewire_fraction: 0.02
+  # MASK mutation: swap mask_swap_count pruned channels (exact swap) with
+  # mask_swap_probability each generation.
+  mask_swap_count: 1
+  mask_swap_probability: 0.20
+  angle_std: 0.15
+  large_angle_probability: 0.05
+  large_angle_std: 1.0
 
 search:
   epsilon: 0.5

@@ -386,19 +386,21 @@ def ratchet_search(
     max_target = min(max_target, width)
 
     # Per-assigned-mutation-rate statistics for this WHOLE variant (accumulate
-    # across ratchet levels). Each explorer SLOT has a fixed rate (1%..32% by
-    # default); we count how often each rate produced an elite/archive win or
-    # got re-based. Keys are the assigned fracs (floats like 0.01..0.32).
-    rate_max = getattr(cfg.ga, "mutation_rate_max", 0.32)
+    # across ratchet levels). Each explorer SLOT has a fixed assigned angle
+    # fraction, linearly spaced in [mutation.angle_fraction_min, ..._max]
+    # (~0.3%..10% by default); we count how often each rate produced an
+    # elite/archive win or got re-based. Keys are the assigned fracs.
+    frac_min = cfg.mutation.angle_fraction_min
+    frac_max = cfg.mutation.angle_fraction_max
     rate_stats: dict[float, dict] = {}
-    for f in assigned_mutation_fracs(cfg.ga.population, rate_max):
+    for f in assigned_mutation_fracs(cfg.ga.population, frac_min, frac_max):
         rate_stats.setdefault(round(f, 6), {"elite_wins": 0, "archive_wins": 0, "rebases": 0})
 
     while target <= max_target:
         gen_limit = cfg.search.rounds if cfg.search.rounds > 0 else 10_000_000
         # --- build initial population for this target ---
         population: list[Individual] = []
-        fracs = assigned_mutation_fracs(cfg.ga.population, rate_max)
+        fracs = assigned_mutation_fracs(cfg.ga.population, frac_min, frac_max)
         for i in range(cfg.ga.population):
             g = make_random_genome(cfg, width, target, rng, fixed_pruned)
             if not use_rotations:

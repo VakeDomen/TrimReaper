@@ -87,7 +87,9 @@ def test_assigned_mutation_rate_stats(tmp_path):
     from trimreaper.ga import assigned_mutation_fracs
     from trimreaper.pipeline import ratchet_search
 
-    fracs = assigned_mutation_fracs(cfg.ga.population, cfg.ga.mutation_rate_max)
+    fracs = assigned_mutation_fracs(cfg.ga.population,
+                                    cfg.mutation.angle_fraction_min,
+                                    cfg.mutation.angle_fraction_max)
     assert len(fracs) == 8
     assert fracs[0] < fracs[-1]
 

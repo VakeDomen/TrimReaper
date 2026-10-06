@@ -17,8 +17,8 @@ from trimreaper.diversity import (
 from trimreaper.ga import (
     Genome,
     Individual,
-    make_child_population,
     make_random_genome,
+    mutate_from_self,
 )
 from trimreaper.rotation import PairRotation
 
@@ -35,7 +35,6 @@ def _cfg():
     cfg.ga.population = 8
     cfg.ga.elitism = 1
     cfg.ga.seed = 0
-    cfg.ga.mutation_rate = 0.8
     cfg.ga.tournament_size = 2
     cfg.search.start_target = 6
     cfg.search.freeze_mask = False
@@ -100,16 +99,15 @@ def test_genome_lineage_ids_across_generations():
     pop = [Individual(genome=make_random_genome(cfg, width, 6, rng)) for _ in range(8)]
     ids0 = {g.genome.id for g in pop}
     assert len(ids0) == 8 and all(i is not None for i in ids0)
-    # elites carry the same id forward; children get fresh ids + parent links
-    children = [Individual(genome=g) for g in make_child_population(cfg, pop, width, 6, rng)]
+    # each explorer self-mutates -> every child has a fresh unique id and a
+    # single self-parent link (no crossover / breeding pool).
+    children = [Individual(genome=mutate_from_self(cfg, ind.genome, width, 6, rng),
+                           fitness=0.0) for ind in pop]
     cids = [g.genome.id for g in children]
     assert len(set(cids)) == len(cids)         # all children unique
-    elites_id = pop[0].genome.id               # best-fitness elite kept verbatim
-    assert any(g.genome.id == elites_id for g in children)
     for ind in children:
-        if ind.genome.id != elites_id:
-            assert len(ind.genome.parent_ids) == 2
-            assert set(ind.genome.parent_ids) <= ids0
+        assert len(ind.genome.parent_ids) == 1
+        assert set(ind.genome.parent_ids) <= ids0   # parent is its own self-parent
 
 
 def test_lineage_frac_detects_elite_descent():

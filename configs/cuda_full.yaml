@@ -44,47 +44,44 @@ data:
   max_docs: 2000            # 0 = unlimited; caps CPU-bound wikitext tokenization
 
 genome:
-  min_rotations: 256                # evolvable-length floor (reviewer: min 256)
-  max_rotations: 4096               # hard ceiling (allows up to 4096 rotations)
+  min_rotations: 256                # rotation-budget floor (see rotations_per_removed)
+  max_rotations: 4096               # rotation-budget ceiling
   rotations_per_removed: 1.0        # budget = clamp(rpr*target, 256, 4096)
                                     #   target=512 -> 512, 1024 -> 1024, 2048 -> 2048
-  initial_rotation_frac: 0.75       # initial genomes start near the budget, not the floor
   min_angle: -6.283185307179586    # +/- 2pi
   max_angle: 6.283185307179586
   delete_survive_bias: 0.95         # STRONGLY prefer deleted<->kept (cross-boundary) rotations
+                                    # Every genome has EXACTLY rotation_budget(target) rotations
+                                    # (fixed count — directly comparable, no add/remove drift).
 
 ga:
-  population: 32            # 32 independent explorers (each self-mutates, no crossover)
-  elitism: 2
+  population: 64            # independent explorers (each self-mutates, no crossover)
+  elitism: 1
   tournament_size: 2          # for REBASING a stuck explorer (best of k bases)
   # Independent-explorer mode: a candidate that goes this many consecutive
   # generations without beating the global elite gets re-based (copy+mutate a
   # tournament-selected base) and starts a fresh search path.
   fail_limit: 5
-  # LEGACY-ONLY: used only by the retired crossover path (unit tests). The
-  # independent-explorer search ignores it — mutation happens 100% of the time.
-  mutation_rate: 0.8
-  add_rotation_p: 0.15
-  remove_rotation_p: 0.10
-  # Independent-explorer mode: GUARANTEED fraction of rotation angles mutated
-  # EVERY generation (100% of the time). 5% -> ~22 angle changes at 440 rot,
-  # ~50 at 1000 rot. Each gets the small Gaussian change (angle_mutate_std)
-  # with an occasional large jump (large_angle_p / large_angle_std).
-  # ASSIGNED-RATE experiment: the active search ignores angle_mutate_frac and
-  # gives each explorer slot a FIXED ascending rate (i+1)/population*rate_max:
-  # with population 32 + rate_max 0.32 that's 1%,2%,...,32% (cautious->aggressive).
-  # The rate is attached to the slot and survives re-basing, so the end report
-  # shows which mutation rates actually produce elite/archive wins.
-  mutation_rate_max: 0.32
-  angle_mutate_frac: 0.05   # fallback only when no per-explorer rate is supplied
-  angle_mutate_p: 0.5
-  angle_mutate_std: 0.15    # small Gaussian angle mutations
-  large_angle_p: 0.05       # occasional large angle for exploration
-  large_angle_std: 1.0
-  replace_a_p: 0.2
-  replace_b_p: 0.2
-  flip_prune_p: 0.2
   seed: 42
+
+mutation:
+  # Per-explorer assigned ANGLE-mutation fraction, linearly spaced across the
+  # population from min to max (cautious -> aggressive). Fixed per slot, survives
+  # re-basing; the end report shows which angle rates produce wins. ANGLE mutation
+  # happens 100% of the time — the fraction controls HOW MANY angles change/gen.
+  angle_fraction_min: 0.003      # ~1 angle on a 440-rotation genome
+  angle_fraction_max: 0.10       # ~44 angles on a 440-rotation genome
+  # PAIR rewire: fraction of rotations whose (a,b) endpoints get re-drawn as a
+  # fresh pruned<->kept pair each generation (same rate for every explorer).
+  pair_rewire_fraction: 0.02
+  # MASK mutation: with mask_swap_probability, swap mask_swap_count pruned
+  # channels for kept ones per generation (exact swap preserves the target).
+  mask_swap_count: 1
+  mask_swap_probability: 0.20
+  # Angle-change distribution: small Gaussian bump, occasional large jump.
+  angle_std: 0.15
+  large_angle_probability: 0.05
+  large_angle_std: 1.0
 
 search:
   # We are collecting the KL-vs-removed CURVE, NOT gatekeeping on epsilon yet.

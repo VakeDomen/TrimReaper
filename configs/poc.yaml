@@ -31,18 +31,19 @@ genome:
 ga:
   population: 32
   elitism: 2
-  tournament_size: 4
-  mutation_rate: 0.3
-  add_rotation_p: 0.15
-  remove_rotation_p: 0.10
-  angle_mutate_p: 0.5
-  angle_mutate_std: 0.15
-  large_angle_p: 0.05
-  large_angle_std: 1.0
-  replace_a_p: 0.2
-  replace_b_p: 0.2
-  flip_prune_p: 0.2
+  tournament_size: 2          # best-of-k bases when re-basing a stuck explorer
+  fail_limit: 5
   seed: 0
+
+mutation:
+  angle_fraction_min: 0.003
+  angle_fraction_max: 0.10
+  pair_rewire_fraction: 0.02
+  mask_swap_count: 1
+  mask_swap_probability: 0.20
+  angle_std: 0.15
+  large_angle_probability: 0.05
+  large_angle_std: 1.0
 
 search:
   epsilon: 0.01           # max allowed held-out KL divergence

@@ -70,10 +70,10 @@ mutation:
   # re-basing; the end report shows which angle rates produce wins. ANGLE mutation
   # happens 100% of the time — the fraction controls HOW MANY angles change/gen.
   angle_fraction_min: 0.003      # ~1 angle on a 440-rotation genome
-  angle_fraction_max: 0.10       # ~44 angles on a 440-rotation genome
+  angle_fraction_max: 0.08       # ~44 angles on a 440-rotation genome
   # PAIR rewire: fraction of rotations whose (a,b) endpoints get re-drawn as a
   # fresh pruned<->kept pair each generation (same rate for every explorer).
-  pair_rewire_fraction: 0.02
+  pair_rewire_fraction: 0.04
   # MASK mutation: with mask_swap_probability, swap mask_swap_count pruned
   # channels for kept ones per generation (exact swap preserves the target).
   mask_swap_count: 1
@@ -83,11 +83,23 @@ mutation:
   large_angle_probability: 0.05
   large_angle_std: 1.0
 
+analysis:
+  # Analytical pre-analysis for the fixed-mask 'rotation extraction' experiment
+  # (CLI `extract`): Wanda-style importance E[h_i^2]*||W_down[:,i]||^2, then the
+  # target weakest channels become the FIXED mask (dead channels included), and
+  # a greedy local-PCA Givens basis is built on max_rows hidden rows. The GA is
+  # then seeded (exact + small + large mutations) from that analytical solution.
+  max_rows: 2048          # hidden rows subsampled for the PCA covariance (0=all)
+  skip_bottom: 0          # skip N very-weakest channels in the mask (0 = include them)
+  n_exact: 1              # GA-seed tiers around the analytical solution
+  n_small: 8
+  n_large: 8
+
 search:
   # We are collecting the KL-vs-removed CURVE, NOT gatekeeping on epsilon yet.
   # Set epsilon high so every target level records instead of being rejected.
   epsilon: 0.5
-  rounds: 20                # generations at the fixed target (per GA method)
+  rounds: 50                # generations at the fixed target (per GA method)
   valid_best_k: 3           # top-K (by fitness) candidates validation-scored each gen
   start_target: 512         # fixed level: delete 512/9728 channels (~5.3%)
   ratchet_step: 256         # unused while start==max; used only if ratcheting

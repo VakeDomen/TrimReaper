@@ -42,6 +42,7 @@ from .ga import (
     make_random_genome,
     mutate_from_self,
     rebase_explorer,
+    seed_population_from,
     tournament_parent,
 )
 from .diversity import (
@@ -349,6 +350,8 @@ def ratchet_search(
     progress=None,
     archive_dir: Optional[str] = None,
     variant: str = "",
+    seed_genome: Optional[object] = None,
+    seed_config: Optional[dict] = None,
 ) -> SearchResult:
     """Run the ratcheting GA for one layer with a given method.
 
@@ -401,11 +404,25 @@ def ratchet_search(
         # --- build initial population for this target ---
         population: list[Individual] = []
         fracs = assigned_mutation_fracs(cfg.ga.population, frac_min, frac_max)
-        for i in range(cfg.ga.population):
-            g = make_random_genome(cfg, width, target, rng, fixed_pruned)
+        if seed_genome is not None:
+            # Seed the initial population from an analytical template (a good
+            # local-PCA starting point) so the GA exploits it, then explores.
+            scfg = seed_config or {}
+            population = seed_population_from(
+                cfg, seed_genome, cfg.ga.population, fracs, rng, width, target,
+                n_exact=scfg.get("n_exact", 1),
+                n_small=scfg.get("n_small", 8),
+                n_large=scfg.get("n_large", 8),
+            )
             if not use_rotations:
-                g.rotations = []
-            population.append(Individual(genome=g, mutation_frac=fracs[i]))
+                for ind in population:
+                    ind.genome.rotations = []
+        else:
+            for i in range(cfg.ga.population):
+                g = make_random_genome(cfg, width, target, rng, fixed_pruned)
+                if not use_rotations:
+                    g.rotations = []
+                population.append(Individual(genome=g, mutation_frac=fracs[i]))
 
         # rolling window of per-generation parent-link maps (newest last), for
         # the elite-lineage fraction over the last ``lineage_lookback`` gens.

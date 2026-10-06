@@ -5,6 +5,8 @@ Subcommands:
               on one layer, producing Pareto points + a frontier plot.
   baselines   Compute the one-shot baseline curves (random / weight-norm /
               activation-magnitude) for a layer.
+  extract     Four-way 'rotation extraction' comparison on a FIXED mask
+              (A no-rot / B random-rot / C local-PCA / D GA-from-PCA).
   compact     Build the physically-compacted MLP for an archived genome and
               report metrics.
   sweep-eps   Print guidance + defaults for the epsilon sweep (0.001/0.01/0.05).
@@ -379,6 +381,163 @@ def cmd_rotsearch(args) -> int:
     return 0
 
 
+def cmd_extract(args) -> int:
+    """Four-way 'rotation extraction' comparison on a FIXED mask.
+
+    Uses the analytical pre-analysis (Wanda-style importance + local-PCA Givens)
+    and compares, on the SAME fixed pruned mask:
+      A. no rotations          (plain deleted channels)
+      B. random rotations      (rotation_budget random Givens around the mask)
+      C. local-PCA rotations   (the analytical greedy builder)
+      D. GA-from-PCA           (GA seeded from C, full mutation)
+    Reports validation + test KL for each, plus the analytical energy report
+    (how much deleted-coordinate energy the PCA basis pushed into kept partners)
+    and the GA's rotation coverage. All four share the identical mask.
+
+    The fixed mask = the ``target`` weakest channels by importance (dead
+    channels are INCLUDED automatically; ``analysis.skip_bottom`` may skip a
+    few of the very weakest). ``data.seq_len`` and ``data.fit_batch`` size the
+    probe calibration pass.
+    """
+    import time
+
+    import torch
+
+    def log(msg: str) -> None:
+        print(f"[extract] {msg}", flush=True)
+
+    cfg = _load_config(args)
+    run_dir = _make_run_dir(cfg, getattr(args, "tag", "") or "")
+    log(f"run outputs -> {run_dir}")
+    t0 = time.time()
+
+    from .analysis import channel_importance, local_pca_rotations, select_fixed_mask
+    from .data import WikiTextStreamer
+    from .evaluate import evaluate_genome_on_set, evaluate_pruned_on_set
+    from .ga import GARandom, Genome, make_random_genome
+    from .model import load_pruned_model
+    from .pipeline import ratchet_search
+
+    pm = load_pruned_model(cfg)
+    layer = cfg.model.layers[0]
+    streamer = WikiTextStreamer(cfg)
+    val_batches = streamer.holdout_batches()
+    test_batches = streamer.test_batches()
+    seq_len = cfg.data.seq_len
+    target = cfg.search.start_target
+    mlp = pm.mlp_modules[layer]
+    width = pm.pristine[layer]["up_proj"].shape[0]
+    target = min(target, width)
+
+    # ---- calibration pass: collect post-SwiGLU hidden over probe batches ----
+    probe_batches = [streamer.batch(cfg.data.fit_batch, seq_len) for _ in range(4)]
+    pm.restore_all()
+    hidden: list[torch.Tensor] = []
+
+    def pre_down(mod, args):
+        hidden.append(args[0].detach().cpu().float().flatten(0, 1))
+
+    handle = mlp.down_proj.register_forward_pre_hook(pre_down)
+    try:
+        with torch.inference_mode():
+            for batch in probe_batches:
+                _ = pm.model(input_ids=batch[:, :seq_len].to(pm.model.device), use_cache=False)
+    finally:
+        handle.remove()
+    H = torch.cat(hidden, dim=0) if hidden else torch.empty(0, width)
+    log(f"calibration hidden collected: {H.shape[0]} tokens")
+
+    # ---- 1) importance + fixed mask ----
+    score = channel_importance([H], pm.pristine[layer]["down_proj"])
+    mask = select_fixed_mask(score, target, skip_bottom=cfg.analysis.skip_bottom)
+    log(f"fixed mask: {target}/{width} weakest channels removed (skip_bottom={cfg.analysis.skip_bottom})")
+
+    # ---- 2) analytical local-PCA rotations + energy report ----
+    rots, report = local_pca_rotations(H, mask, max_rows=cfg.analysis.max_rows)
+    log(f"local-PCA: {report['n_rot']} rotations, deleted-energy "
+        f"before={report['deleted_before_energy']:.4f} after={report['deleted_after_energy']:.4f} "
+        f"ratio={report['energy_ratio']:.4f}")
+
+    # ---- 3) evaluate the four variants on the SAME mask ----
+    rngwrap = GARandom(cfg)
+    rng = rngwrap.python
+
+    # A. no rotations
+    klA_val = evaluate_pruned_on_set(pm, val_batches, layer, mask, seq_len)
+    klA_test = evaluate_pruned_on_set(pm, test_batches, layer, mask, seq_len)
+    log(f"A no-rotation: val={klA_val:.5f} test={klA_test:.5f}")
+
+    # B. random rotations (same budget as the PCA gives)
+    from .ga import rotation_budget
+    n_rot = rotation_budget(cfg, target) if report["n_rot"] == 0 else report["n_rot"]
+    rand_genome = make_random_genome(cfg, width, target, rng, fixed_pruned=set(mask))
+    rand_genome.rotations = rand_genome.rotations[:n_rot]
+    klB_val = evaluate_genome_on_set(pm, val_batches, layer, rand_genome, seq_len)
+    klB_test = evaluate_genome_on_set(pm, test_batches, layer, rand_genome, seq_len)
+    log(f"B random-rot: val={klB_val:.5f} test={klB_test:.5f} n_rot={len(rand_genome.rotations)}")
+
+    # C. local-PCA rotations
+    pca_genome = Genome(rotations=rots, pruned=set(mask))
+    pca_genome.id = -1
+    klC_val = evaluate_genome_on_set(pm, val_batches, layer, pca_genome, seq_len)
+    klC_test = evaluate_genome_on_set(pm, test_batches, layer, pca_genome, seq_len)
+    log(f"C local-PCA: val={klC_val:.5f} test={klC_test:.5f} n_rot={len(rots)}")
+
+    # D. GA from PCA seed (freeze the mask, seed from the analytical solution)
+    cfg.search.freeze_mask = True
+    cfg.search.frozen_pruned = mask
+    cfg.search.start_target = target
+    cfg.search.max_target = target
+    res = ratchet_search(
+        pm, cfg, layer, streamer, val_batches, use_rotations=True,
+        progress=None, archive_dir=run_dir, variant="ga_pca",
+        seed_genome=pca_genome,
+    )
+    klD_val = res.points[0].validated_kl if res.points else float("nan")
+    bg = res.best_genome
+    klD_test = float("nan")
+    if bg is not None:
+        from .ga import coverage_stats
+        cov = coverage_stats(bg)
+        klD_test = evaluate_genome_on_set(pm, test_batches, layer, bg, seq_len)
+        log(f"D GA-from-PCA: val={klD_val:.5f} test={klD_test:.5f} gens={res.n_generations} "
+            f"n_rot={cov['n_rot']} pruned-touched={cov['unique_pruned_touched']}")
+    else:
+        log("D GA-from-PCA: no archived genome")
+
+    # ---- 4) report ----
+    cfg.search.freeze_mask = False
+    results = {
+        "target": target,
+        "width": width,
+        "mask": mask,
+        "skip_bottom": cfg.analysis.skip_bottom,
+        "mask_importance_rank": [int(i) for i in mask],
+        "analytical": {
+            "n_rot": report["n_rot"],
+            "deleted_before_energy": report["deleted_before_energy"],
+            "deleted_after_energy": report["deleted_after_energy"],
+            "energy_ratio": report["energy_ratio"],
+        },
+        "no_rotation": {"val_kl": klA_val, "test_kl": klA_test},
+        "random_rotation": {"val_kl": klB_val, "test_kl": klB_test, "n_rot": len(rand_genome.rotations)},
+        "local_pca": {"val_kl": klC_val, "test_kl": klC_test, "n_rot": len(rots)},
+        "ga_from_pca": {
+            "val_kl": klD_val, "test_kl": klD_test, "generations": res.n_generations,
+            "rate_stats": getattr(res, "rate_stats", {}),
+        },
+        "run_dir": run_dir,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config": _config_to_dict(cfg),
+    }
+    report_path = os.path.join(run_dir, "extract_results.json")
+    with open(report_path, "w") as fh:
+        json.dump(results, fh, indent=2)
+    log(f"results saved -> {report_path}")
+    log(f"DONE in {time.time()-t0:.1f}s")
+    return 0
+
+
 def cmd_baselines(args) -> int:
     cfg = _load_config(args)
     from .data import WikiTextStreamer
@@ -459,6 +618,13 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--layers", default=None, help="comma-separated layer indices")
     _add_override_args(b)
     b.set_defaults(func=cmd_baselines)
+
+    ex = sub.add_parser("extract", help="four-way rotation-extraction comparison "
+                                        "(A no-rot / B random / C local-PCA / D GA-from-PCA) on a fixed mask")
+    ex.add_argument("--layers", default=None, help="comma-separated layer indices")
+    ex.add_argument("--tag", default="", help="optional suffix for the dated run folder")
+    _add_override_args(ex)
+    ex.set_defaults(func=cmd_extract)
 
     c = sub.add_parser("compact", help="build compact MLP for an archived genome")
     c.add_argument("--layers", default=None, help="comma-separated layer indices")

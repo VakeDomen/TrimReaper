@@ -134,6 +134,35 @@ class MutationConfig:
 
 
 @dataclass
+class AnalysisConfig:
+    """Analytical (non-evolutionary) pre-analysis for the fixed-mask experiment.
+
+    Channel importance uses the Wanda-style score E[h_i^2] * ||W_down[:,i]||^2
+    (activation energy x outgoing weight norm); channels are ranked ascending
+    (least important first). The fixed pruned mask takes the ``target`` weakest
+    channels; the truly-dead ones are INCLUDED automatically (deleting them is
+    free — ``skip_bottom`` defaults to 0 to skip a band if ever wanted).
+    ``local_pca_rotations`` greedily pairs each deleted channel with a kept
+    partner that zeroes its 2x2 variance (on ``max_rows`` cached hidden rows)
+    and composes the exact Givens rotations, then the GA is seeded from that
+    analytical solution.
+    """
+
+    # Subsample cap of cached hidden rows used for the covariance/energy math in
+    # local_pca_rotations (0 = use all rows). Reduces the offline sweep cost.
+    max_rows: int = 2048
+    # Number of the very weakest channels to skip when building the mask (0 =
+    # include them, the intended default).
+    skip_bottom: int = 0
+    # GA seeding around the analytical solution: n_exact exact clones, n_small
+    # mild angle perturbations, n_large stronger angle + pair-rewire mutations,
+    # remainder random.
+    n_exact: int = 1
+    n_small: int = 8
+    n_large: int = 8
+
+
+@dataclass
 class SearchConfig:
     """Ratcheting search / objective settings."""
 
@@ -169,6 +198,7 @@ class Config:
     genome: GenomeConfig = field(default_factory=GenomeConfig)
     ga: GaConfig = field(default_factory=GaConfig)
     mutation: MutationConfig = field(default_factory=MutationConfig)
+    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
 
     @classmethod

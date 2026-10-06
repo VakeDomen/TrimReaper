@@ -200,6 +200,60 @@ def make_random_genome(cfg: Config, width: int, target: int, rng: random.Random,
     return g
 
 
+def _perturb_angles(cfg: Config, g: Genome, rng: random.Random, frac: float) -> None:
+    """Perturb a fraction of a genome's rotation angles by a Gaussian bump."""
+    n = len(g.rotations)
+    if n == 0 or frac <= 0:
+        return
+    n_angle = max(1, min(n, int(round(frac * n))))
+    for i in rng.sample(range(n), n_angle):
+        rot = g.rotations[i]
+        g.rotations[i] = PairRotation(rot.a, rot.b, rot.angle + rng.gauss(0, cfg.mutation.angle_std))
+
+
+def seed_population_from(
+    cfg: Config,
+    template: Genome,
+    population: int,
+    fracs: list[float],
+    rng: random.Random,
+    width: int,
+    target: int,
+    n_exact: int = 1,
+    n_small: int = 8,
+    n_large: int = 8,
+) -> list[Individual]:
+    """Build an initial population seeded from an analytical template genome.
+
+    The first ``n_exact`` slots are exact clones of ``template`` (the analytical
+    local-PCA solution); the next ``n_small`` are clones with a small angle
+    perturbation; the next ``n_large`` get a larger angle perturbation plus a
+    pair rewire; the remaining slots are random genomes (``make_random_genome``).
+    All share the template's FIXED pruned mask (the markers stay identical; only
+    rotations seed the search). Each Individual keeps its assigned slot
+    ``mutation_frac`` from ``fracs``.
+    """
+    fixed_pruned = set(template.pruned)
+    individuals: list[Individual] = []
+    for i in range(population):
+        frac = fracs[i] if i < len(fracs) else 0.0
+        if i < n_exact:
+            g = clone_genome(template, keep_id=False)
+        elif i < n_exact + n_small:
+            g = clone_genome(template, keep_id=False)
+            _perturb_angles(cfg, g, rng, cfg.mutation.angle_fraction_max)
+        elif i < n_exact + n_small + n_large:
+            g = clone_genome(template, keep_id=False)
+            _perturb_angles(cfg, g, rng, 0.5)
+            _rewire_pairs(cfg, g, width, rng)
+        else:
+            g = make_random_genome(cfg, width, target, rng, fixed_pruned=fixed_pruned)
+        g.pruned = set(fixed_pruned)   # markers stay frozen for the whole seeding
+        individuals.append(Individual(genome=g, mutation_frac=frac))
+    return individuals
+
+
+
 def clone_genome(genome: Genome, keep_id: bool = True) -> Genome:
     """Return an independent copy of a genome.
 
